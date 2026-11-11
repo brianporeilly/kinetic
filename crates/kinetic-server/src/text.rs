@@ -3,6 +3,8 @@
 //! Text arrives in arbitrary pieces, so both stages hold back a tail that
 //! could still turn into a stop string or a tag.
 
+use crate::tool_calls::OPENERS;
+
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 /// Reasoning tags: `<think>` and Gemma 4's thought channel.
@@ -70,9 +72,16 @@ impl Split {
 /// Routes text between `<think>` and `</think>`, or inside Gemma 4's
 /// thought channel, to the reasoning and the rest to the content, dropping
 /// the tags and the blank space after them.
+///
+/// With [`ThinkSplitter::with_calls`], the start of a tool call also ends
+/// the reasoning: some models, such as Qwen3.5 with thinking on, go from
+/// their reasoning straight to a call without closing it, and the call
+/// belongs to the reply.
 pub struct ThinkSplitter {
     /// The close tag awaited inside a reasoning block.
     thinking: Option<&'static str>,
+    /// Openers of tool calls, which end reasoning and stay in the content.
+    calls: &'static [&'static str],
     /// Whitespace at the start of a part is dropped until text arrives.
     at_start: bool,
     pending: String,
@@ -83,8 +92,31 @@ impl ThinkSplitter {
     pub fn new(thinking: bool) -> Self {
         ThinkSplitter {
             thinking: thinking.then_some(THINK_CLOSE),
+            calls: &[],
             at_start: true,
             pending: String::new(),
+        }
+    }
+
+    /// Ends reasoning at the start of a tool call too, for a request that
+    /// offers tools.
+    pub fn with_calls(self) -> Self {
+        ThinkSplitter {
+            calls: OPENERS,
+            ..self
+        }
+    }
+
+    /// The first end of the open reasoning in the pending text: where it
+    /// starts, how much of it to drop, and the reasoning's close tag;
+    /// a call opener is kept.
+    fn reasoning_end(&self, close: &'static str) -> Option<(usize, usize)> {
+        let closed = self.pending.find(close).map(|at| (at, close.len()));
+        let called = self.calls.iter().filter_map(|o| self.pending.find(o)).min();
+        match (closed, called) {
+            (Some((at, len)), Some(call)) if at <= call => Some((at, len)),
+            (_, Some(call)) => Some((call, 0)),
+            (closed, None) => closed,
         }
     }
 
@@ -103,17 +135,19 @@ impl ThinkSplitter {
         }
         loop {
             let found = match self.thinking {
-                Some(close) => self.pending.find(close).map(|at| (at, close, None)),
+                Some(close) => self.reasoning_end(close).map(|(at, len)| (at, len, None)),
                 None => THINK_TAGS
                     .iter()
                     .filter_map(|&(open, close)| {
-                        self.pending.find(open).map(|at| (at, open, Some(close)))
+                        self.pending
+                            .find(open)
+                            .map(|at| (at, open.len(), Some(close)))
                     })
                     .min_by_key(|&(at, ..)| at),
             };
             match found {
-                Some((at, tag, next)) => {
-                    let rest = self.pending.split_off(at + tag.len());
+                Some((at, len, next)) => {
+                    let rest = self.pending.split_off(at + len);
                     self.pending.truncate(at);
                     let part = std::mem::replace(&mut self.pending, rest);
                     self.emit(&part, &mut out);
@@ -122,7 +156,11 @@ impl ThinkSplitter {
                 }
                 None => {
                     let hold = match self.thinking {
-                        Some(close) => partial_suffix(&self.pending, close),
+                        Some(close) => std::iter::once(close)
+                            .chain(self.calls.iter().copied())
+                            .map(|tag| partial_suffix(&self.pending, tag))
+                            .max()
+                            .unwrap_or(0),
                         None => THINK_TAGS
                             .iter()
                             .map(|&(open, _)| partial_suffix(&self.pending, open))
@@ -278,6 +316,50 @@ mod tests {
     fn prompt_can_open_the_reasoning() {
         let s = feed_think(true, &["hmm</think>", "\n\nYes"]);
         assert_eq!((s.reasoning.as_str(), s.content.as_str()), ("hmm", "Yes"));
+    }
+
+    fn feed_think_calls(pieces: &[&str]) -> Split {
+        let mut t = ThinkSplitter::new(true).with_calls();
+        let mut out = Split::default();
+        for p in pieces {
+            let s = t.push(p);
+            out.reasoning += &s.reasoning;
+            out.content += &s.content;
+        }
+        let s = t.finish();
+        out.reasoning += &s.reasoning;
+        out.content += &s.content;
+        out
+    }
+
+    #[test]
+    fn a_call_ends_reasoning_left_open() {
+        let s = feed_think_calls(&[
+            "Write `<count><TAB><word>`.\n\nLet me start.\n\n<tool",
+            "_call>\n<function=sandbox_shell>\n</function>\n</tool_call>",
+        ]);
+        assert_eq!(
+            s.reasoning,
+            "Write `<count><TAB><word>`.\n\nLet me start.\n\n"
+        );
+        assert_eq!(
+            s.content,
+            "<tool_call>\n<function=sandbox_shell>\n</function>\n</tool_call>"
+        );
+    }
+
+    #[test]
+    fn a_closed_reasoning_comes_before_its_calls() {
+        let s = feed_think_calls(&["plan</think>\n\n<tool_call>\n{}</tool_call>"]);
+        assert_eq!(s.reasoning, "plan");
+        assert_eq!(s.content, "<tool_call>\n{}</tool_call>");
+    }
+
+    #[test]
+    fn without_tools_a_call_stays_in_the_reasoning() {
+        let s = feed_think(true, &["try <tool_call> here</think>Done"]);
+        assert_eq!(s.reasoning, "try <tool_call> here");
+        assert_eq!(s.content, "Done");
     }
 
     #[test]
