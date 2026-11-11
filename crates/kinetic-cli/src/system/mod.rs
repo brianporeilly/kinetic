@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-pub use gpu::{cuda_free, gpus, Gpu};
+pub use gpu::{cuda_free, cuda_links, gpus, Gpu};
 
 /// The CPU and memory.
 pub struct Machine {

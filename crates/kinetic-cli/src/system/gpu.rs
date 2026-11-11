@@ -63,6 +63,80 @@ fn cuda() -> Result<Vec<Gpu>, String> {
     Ok(gpus)
 }
 
+/// For each ordered pair of CUDA GPUs, a line on how copies between them
+/// go, which a model spread over them with `--gpus` makes for every token,
+/// and the fixes those copies call for.
+#[cfg(feature = "cuda")]
+pub fn cuda_links() -> (Vec<String>, Vec<String>) {
+    use kinetic_cuda::peer::{time_copies, CopyTiming, LARGE_COPY, SMALL_COPY};
+    use kinetic_cuda::{peer_access_allowed, Device};
+    let n = Device::count().unwrap_or(0);
+    let (mut lines, mut fixes) = (Vec::new(), Vec::new());
+    let show = |t: &CopyTiming| {
+        let small = t
+            .small_us
+            .map_or("did not finish".into(), |us| format!("{us:.0} µs"));
+        let large = t
+            .large_bytes_per_s
+            .map_or("did not finish".into(), |b| format!("{:.1} GB/s", b / 1e9));
+        (small, large)
+    };
+    for (i, j) in (0..n).flat_map(|i| (0..n).filter(move |&j| j != i).map(move |j| (i, j))) {
+        let measured = Device::get(i)
+            .and_then(|a| Device::get(j).map(|b| (a, b)))
+            .and_then(|(a, b)| time_copies(a, b));
+        let p = match measured {
+            Ok(p) => p,
+            Err(e) => {
+                lines.push(format!("{i} → {j}: {e}"));
+                continue;
+            }
+        };
+        let (hs, hl) = show(&p.through_host);
+        let mut line = format!(
+            "{i} → {j}: {} KB copy {hs} through RAM, {} MB at {hl}",
+            SMALL_COPY >> 10,
+            LARGE_COPY >> 20
+        );
+        match &p.direct {
+            Some(d) => {
+                let (ds, dl) = show(d);
+                line += &format!("; direct access {ds}, {dl}");
+                let slower = match (d.small_us, p.through_host.small_us) {
+                    (None, _) => true,
+                    (Some(direct), Some(host)) => direct > 2.0 * host,
+                    (Some(_), None) => false,
+                };
+                if slower && peer_access_allowed() {
+                    fixes.push(format!(
+                        "copies from GPU {i} to GPU {j} are slower with direct access than through RAM, often from the IOMMU or PCIe access control; run with KINETIC_CUDA_P2P=0 when using --gpus"
+                    ));
+                }
+                if !peer_access_allowed() {
+                    line += " (off: KINETIC_CUDA_P2P)";
+                }
+            }
+            None => line += "; no direct access",
+        }
+        if p.through_host.small_us.is_none() {
+            fixes.push(format!(
+                "copies from GPU {i} to GPU {j} did not finish in 5 s; check the driver, and `dmesg` for IOMMU faults"
+            ));
+        }
+        lines.push(line);
+        if p.stuck {
+            // a copy may still be running; further pairs would queue behind it
+            break;
+        }
+    }
+    (lines, fixes)
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn cuda_links() -> (Vec<String>, Vec<String>) {
+    (Vec::new(), Vec::new())
+}
+
 #[cfg(not(feature = "cuda"))]
 fn cuda() -> Result<Vec<Gpu>, String> {
     Err("this kinetic was built without CUDA".into())

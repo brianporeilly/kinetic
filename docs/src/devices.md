@@ -123,6 +123,24 @@ spill layers to the CPU on one GPU runs wholly on two, and the answer is the
 same, bit for bit, as on one GPU of the same kind. Layers that still do not
 fit run on the CPU, and `--gpu-layers` counts the layers over all GPUs.
 
+`kinetic doctor` numbers the CUDA GPUs and, with more than one, times the
+copies between each pair: a token-sized copy and a large one, through
+system memory and with direct access where the driver offers it.
+`kinetic fit --gpus 0,1` estimates where models go and how fast they run
+over those GPUs together.
+
+**If a model is much slower over several GPUs than on one,** direct access
+between them is the usual cause: on some hosts, often with an IOMMU or PCIe
+access control between the GPUs, the driver offers it but direct copies
+crawl or stall. `kinetic doctor` shows it, and `KINETIC_CUDA_P2P=0` turns
+direct access off so copies go through system memory, which costs a few
+microseconds a token:
+
+```sh
+KINETIC_CUDA_P2P=0 kinetic run model.gguf --gpus 0,1 "Hello"
+podman run -e KINETIC_CUDA_P2P=0 ...        # in a container
+```
+
 For now, `--gpus` takes dense models without per-layer inputs or shared
 attention caches (not mixture-of-experts models or Gemma 4 E2B/E4B), leaves
 out the drafts of a model's own prediction block (drafts from lookups still

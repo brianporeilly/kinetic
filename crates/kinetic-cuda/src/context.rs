@@ -9,6 +9,17 @@ use crate::error::Result;
 /// process asked first, which is as good.
 const PEER_ACCESS_ALREADY_ENABLED: i32 = 704;
 
+/// Whether `KINETIC_CUDA_P2P` leaves direct access between devices on: any
+/// value but `0`, `off`, `no` or `false` does, as does leaving it unset.
+pub fn peer_access_allowed() -> bool {
+    std::env::var("KINETIC_CUDA_P2P").map_or(true, |v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "no" | "false"
+        )
+    })
+}
+
 /// A device's primary context.
 ///
 /// Every resource holds an `Rc` to the context it was made in, so the
@@ -42,10 +53,22 @@ impl Context {
     /// NVLink or PCIe, where the two devices can; returns whether they can.
     /// Copies between contexts work either way, those between devices
     /// without access going through host memory, which the driver handles.
+    ///
+    /// `KINETIC_CUDA_P2P=0` turns direct access off: on some hosts, often
+    /// with an IOMMU or PCIe access control between the GPUs, the driver
+    /// offers it but direct copies are far slower than through memory.
     pub fn enable_peer_access(&self, peer: &Context) -> Result<bool> {
         if self.device == peer.device {
             return Ok(true);
         }
+        if !peer_access_allowed() {
+            return Ok(false);
+        }
+        self.enable_peer_access_anyway(peer)
+    }
+
+    /// [`Context::enable_peer_access`] whatever `KINETIC_CUDA_P2P` says.
+    pub(crate) fn enable_peer_access_anyway(&self, peer: &Context) -> Result<bool> {
         let api = self.enter()?;
         let mut can = 0;
         // SAFETY: `can` is a valid out-pointer; both devices are valid.
@@ -70,6 +93,16 @@ impl Context {
             (self.api.ctx_set_current)(self.raw)
         })?;
         Ok(self.api)
+    }
+
+    /// Stops direct access to `peer`'s memory, which
+    /// [`Context::enable_peer_access`] allowed.
+    pub(crate) fn disable_peer_access(&self, peer: &Context) -> Result<()> {
+        let api = self.enter()?;
+        // SAFETY: `peer.raw` is a retained context.
+        api.check("cuCtxDisablePeerAccess", unsafe {
+            (api.ctx_disable_peer_access)(peer.raw)
+        })
     }
 
     /// Waits for all work in this context.

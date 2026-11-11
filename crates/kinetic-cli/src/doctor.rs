@@ -39,8 +39,25 @@ pub fn run() -> Result<()> {
         gib(m.ram_available),
         bandwidth / 1e9
     )?;
+    // numbered as --gpus takes them, where there is a choice
+    let several = gpus.iter().filter(|g| g.api == "CUDA").count() > 1;
+    let mut cuda_index = 0;
     for g in &gpus {
-        writeln!(out, "  gpu      {}", describe(g))?;
+        let label = match g.api == "CUDA" && several {
+            true => {
+                cuda_index += 1;
+                format!("gpu {:<5}", cuda_index - 1)
+            }
+            false => "gpu      ".into(),
+        };
+        writeln!(out, "  {label}{}", describe(g))?;
+    }
+    let (links, link_fixes) = match several {
+        true => system::cuda_links(),
+        false => (Vec::new(), Vec::new()),
+    };
+    for l in &links {
+        writeln!(out, "  gpus     {l}")?;
     }
     for n in &notes {
         writeln!(out, "  gpu      {n}")?;
@@ -67,7 +84,7 @@ pub fn run() -> Result<()> {
         )?;
     }
 
-    let mut fixes = Vec::new();
+    let mut fixes = link_fixes;
     if !(m.avx2 && m.fma && m.f16c) {
         fixes.push("this CPU lacks AVX2, FMA or F16C, which Kinetic's CPU kernels use; expect slow CPU runs".to_owned());
     }

@@ -185,6 +185,11 @@ enum Command {
     Fit {
         /// A model, a model's name or a folder [default: every model found]
         target: Option<PathBuf>,
+        /// Estimate for a model spread over these CUDA GPUs, such as 0,1, as
+        /// `--gpus` on run and serve spreads it [default: the GPU with the
+        /// most free memory]
+        #[arg(long, value_name = "LIST", value_delimiter = ',')]
+        gpus: Vec<usize>,
     },
     /// List the models on this computer, from Ollama, LM Studio, the
     /// Hugging Face and llama.cpp caches and Kinetic's own folder
@@ -710,7 +715,7 @@ fn run(cli: Cli) -> Result<()> {
             )
         }
         Command::Doctor => doctor::run(),
-        Command::Fit { target } => fit::run(target.as_deref()),
+        Command::Fit { target, gpus } => fit::run(target.as_deref(), &gpus),
         Command::Pull {
             repo,
             file,

@@ -160,7 +160,38 @@ fn place(w: &Weights, gpu: Option<(u64, f64)>, cpu_bandwidth: f64) -> (&'static 
     speeds("CPU", &|_, c| per_token / (cpu_bandwidth * c))
 }
 
-pub fn run(target: Option<&Path>) -> Result<()> {
+impl Speeds {
+    /// [`Speeds::measure`] for a model spread over the CUDA GPUs `list`, by
+    /// their CUDA numbers: their free memory adds up, less the headroom of
+    /// each but one, and a token reads each GPU's share at its bandwidth.
+    pub fn measure_over(gpus: &[Gpu], list: &[usize]) -> Result<Speeds> {
+        let cuda: Vec<&Gpu> = gpus.iter().filter(|g| g.api == "CUDA").collect();
+        let mut free = 0u64;
+        let mut seconds_per_byte = 0.0;
+        for &i in list {
+            let g = cuda.get(i).ok_or_else(|| {
+                format!(
+                    "no CUDA GPU {i}: this computer has {}, numbered from 0",
+                    cuda.len()
+                )
+            })?;
+            let f = g.memory_free.unwrap_or(g.memory_total);
+            let bandwidth = g
+                .bandwidth
+                .ok_or_else(|| format!("{} reports no bandwidth", g.name))?;
+            free += f;
+            seconds_per_byte += f as f64 / bandwidth;
+        }
+        let bandwidth = free as f64 / seconds_per_byte;
+        let free = free.saturating_sub(HEADROOM * (list.len() as u64).saturating_sub(1));
+        Ok(Speeds {
+            gpu: (seconds_per_byte > 0.0).then_some((free, bandwidth)),
+            cpu_bandwidth: system::memory_bandwidth(),
+        })
+    }
+}
+
+pub fn run(target: Option<&Path>, list: &[usize]) -> Result<()> {
     let models: Vec<Local> = match target {
         None => library::discover(),
         Some(dir) if dir.is_dir() => library::in_folder(dir),
@@ -168,8 +199,20 @@ pub fn run(target: Option<&Path>) -> Result<()> {
     };
     let machine = system::machine();
     let (gpus, _) = system::gpus();
-    let speeds = Speeds::measure(&gpus);
-    let cuda = best_cuda(&gpus);
+    let (speeds, gpu_name) = match list {
+        [] => (
+            Speeds::measure(&gpus),
+            best_cuda(&gpus).map(|g| g.name.clone()),
+        ),
+        _ => {
+            let cuda: Vec<&Gpu> = gpus.iter().filter(|g| g.api == "CUDA").collect();
+            let names: Vec<String> = list
+                .iter()
+                .filter_map(|&i| cuda.get(i).map(|g| format!("GPU {i} {}", g.name)))
+                .collect();
+            (Speeds::measure_over(&gpus, list)?, Some(names.join(" + ")))
+        }
+    };
 
     let mut out = std::io::stdout().lock();
     if models.is_empty() {
@@ -209,10 +252,9 @@ pub fn run(target: Option<&Path>) -> Result<()> {
         };
         writeln!(out, "{:<width$}  {line}", m.name)?;
     }
-    let gpu_note = match (cuda, speeds.gpu) {
-        (Some(g), Some((free, bw))) => format!(
-            "{} with {:.1} GiB free at {:.0} GB/s nominal",
-            g.name,
+    let gpu_note = match (gpu_name, speeds.gpu) {
+        (Some(name), Some((free, bw))) => format!(
+            "{name} with {:.1} GiB free at {:.0} GB/s nominal",
             free as f64 / GIB,
             bw / 1e9
         ),

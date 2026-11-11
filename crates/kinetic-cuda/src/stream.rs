@@ -62,6 +62,9 @@ impl Drop for Stream {
     }
 }
 
+/// `CUDA_ERROR_NOT_READY`: the event has not been reached yet.
+const NOT_READY: i32 = 600;
+
 /// A marker in a stream, used to time device work or to order streams.
 pub struct Event {
     raw: CuEvent,
@@ -96,6 +99,24 @@ impl Event {
         api.check("cuEventSynchronize", unsafe {
             (api.event_synchronize)(self.raw)
         })
+    }
+
+    /// Waits until the stream has passed this event or `timeout` has gone
+    /// by, polling; returns whether it passed.
+    pub fn wait_for(&self, timeout: std::time::Duration) -> Result<bool> {
+        let api = self.ctx.enter()?;
+        let start = std::time::Instant::now();
+        loop {
+            // SAFETY: `raw` is a live event.
+            let status = unsafe { (api.event_query)(self.raw) };
+            if status != NOT_READY {
+                return api.check("cuEventQuery", status).map(|()| true);
+            }
+            if start.elapsed() >= timeout {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
     }
 
     /// Milliseconds from this event to `later`; both must have completed.

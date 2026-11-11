@@ -458,10 +458,11 @@ To fix:
 kinetic fit
 kinetic fit qwen3:4b
 kinetic fit D:\models
+kinetic fit model.gguf --gpus 0,1
 ```
 
 For every model found, or the one or the folder given: whether it fits
-wholly on the GPU, needs its experts kept on the CPU (mixture-of-experts
+wholly on the GPU (or, with `--gpus`, on those GPUs together), needs its experts kept on the CPU (mixture-of-experts
 models), or runs on the CPU, with a decode speed range estimated from the
 bytes it reads per token and the memory bandwidth. `kinetic bench` measures
 the real speed.

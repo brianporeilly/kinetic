@@ -78,6 +78,7 @@ entry_points! {
     memcpy_async = "cuMemcpyAsync"(CuDevicePtr, CuDevicePtr, usize, CuStream);
     device_can_access_peer = "cuDeviceCanAccessPeer"(*mut c_int, CuDevice, CuDevice);
     ctx_enable_peer_access = "cuCtxEnablePeerAccess"(CuContext, c_uint);
+    ctx_disable_peer_access = "cuCtxDisablePeerAccess"(CuContext);
     memset_d8 = "cuMemsetD8_v2"(CuDevicePtr, u8, usize);
     memset_d8_async = "cuMemsetD8Async"(CuDevicePtr, u8, usize, CuStream);
     mem_host_alloc = "cuMemHostAlloc"(*mut *mut c_void, usize, c_uint);
@@ -98,6 +99,7 @@ entry_points! {
     event_destroy = "cuEventDestroy_v2"(CuEvent);
     event_record = "cuEventRecord"(CuEvent, CuStream);
     event_synchronize = "cuEventSynchronize"(CuEvent);
+    event_query = "cuEventQuery"(CuEvent);
     event_elapsed_time = "cuEventElapsedTime"(*mut f32, CuEvent, CuEvent);
     stream_begin_capture = "cuStreamBeginCapture_v2"(CuStream, c_uint);
     stream_end_capture = "cuStreamEndCapture"(CuStream, *mut CuGraph);
