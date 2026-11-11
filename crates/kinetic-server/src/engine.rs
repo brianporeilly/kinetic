@@ -511,7 +511,10 @@ impl<'a> Engine<'a> {
 
         let mut decoder = self.tokenizer.stream();
         let mut stops = StopStrings::new(&request.stop);
-        let mut think = prompt.thinking.map(ThinkSplitter::new);
+        let mut think = prompt.thinking.map(|open| match prompt.tools.is_empty() {
+            true => ThinkSplitter::new(open),
+            false => ThinkSplitter::new(open).with_calls(),
+        });
         let mut tools = (!prompt.tools.is_empty()).then(ToolSplitter::new);
         let calls = |mut part: Split, tools: &mut Option<ToolSplitter>| {
             if let Some(t) = tools.as_mut() {

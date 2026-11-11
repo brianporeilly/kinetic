@@ -13,6 +13,13 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
 - LFM2.5 mixture of experts (`lfm2moe`), experimental, on the CPU and CUDA,
   with experts kept in system memory when they do not fit the GPU.
 
+### Server
+
+- A tool call that starts while reasoning is still open ends the reasoning
+  and comes back as a tool call. Qwen3.5 with thinking on often writes
+  `<tool_call>` without closing `</think>` first; the call used to stay in
+  `reasoning_content` and the reply ended with `finish_reason: "stop"`.
+
 ## [0.1.0] - 2026-11-05
 
 The first public release.

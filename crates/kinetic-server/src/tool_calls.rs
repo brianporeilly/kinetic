@@ -24,7 +24,7 @@ pub struct ToolCall {
 }
 
 /// Text that starts the calls in one of the formats.
-const OPENERS: &[&str] = &[
+pub(crate) const OPENERS: &[&str] = &[
     "<tool_call>",
     "<|tool_call_start|>",
     "[TOOL_CALLS]",
@@ -438,6 +438,46 @@ mod tests {
             name: name.into(),
             arguments: arguments.to_string(),
         }
+    }
+
+    /// What Qwen3.5 9B wrote with thinking on: the prompt left `<think>`
+    /// open, and the reply went from its reasoning straight to a call.
+    #[test]
+    fn a_call_after_unclosed_reasoning_is_a_call() {
+        use crate::text::ThinkSplitter;
+        let tools = [json!({"type": "function", "function": {
+            "name": "sandbox_shell",
+            "parameters": {"type": "object", "properties": {
+                "command": {"type": "string"},
+            }},
+        }})];
+        let pieces = [
+            "- Order by count desc, then word asc (byte-wise)\n",
+            "- Error handling with exit status 2\n\nLet me create the workspace ",
+            "directory and the files.\n\n<tool",
+            "_call>\n<function=sandbox_shell>\n<parameter=command>\nmkdir -p ",
+            "runs/wordfreq/workspace\n</parameter>\n</function>\n</tool_call>",
+        ];
+        let mut think = ThinkSplitter::new(true).with_calls();
+        let mut calls = ToolSplitter::new();
+        let (mut reasoning, mut text) = (String::new(), String::new());
+        let mut parts: Vec<_> = pieces.iter().map(|p| think.push(p)).collect();
+        parts.push(think.finish());
+        for part in parts {
+            reasoning += &part.reasoning;
+            text += &calls.push(&part.content);
+        }
+        let (rest, found) = calls.finish(&tools);
+        text += &rest;
+        assert!(reasoning.ends_with("Let me create the workspace directory and the files.\n\n"));
+        assert_eq!(text, "");
+        assert_eq!(
+            found,
+            [call(
+                "sandbox_shell",
+                json!({"command": "mkdir -p runs/wordfreq/workspace"})
+            )]
+        );
     }
 
     #[test]
