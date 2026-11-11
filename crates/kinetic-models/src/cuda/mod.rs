@@ -237,7 +237,11 @@ impl CudaState {
 /// A recorded one-token step and the host buffers it leaves its greedy
 /// token and hidden state in.
 struct Step {
-    graph: Graph,
+    /// One graph on one device; over several devices, one per device in
+    /// turn and the head's last, which [`CudaModel::launch_step`] runs with
+    /// the hand-overs between them. A graph never spans devices: drivers
+    /// may deadlock destroying one that does.
+    graphs: Vec<Graph>,
     greedy: PinnedBuffer<u32>,
     hidden: PinnedBuffer<f32>,
 }
@@ -798,7 +802,7 @@ impl<'m> CudaModel<'m> {
                     self.embed(&mut state.work, chunk)?;
                 }
                 if let Some(step) = &state.step {
-                    step.graph.launch(&self.gpu.stream)?;
+                    self.launch_step(step, &mut state.work)?;
                     self.gpu.stream.synchronize()?;
                     out.greedy.extend_from_slice(step.greedy.as_slice());
                     out.hidden[done * d..][..d].copy_from_slice(step.hidden.as_slice());
@@ -841,25 +845,73 @@ impl<'m> CudaModel<'m> {
         let stream = &self.gpu.stream;
         let mut greedy = PinnedBuffer::new(&self.gpu.ctx, 1)?;
         let mut hidden = PinnedBuffer::new(&self.gpu.ctx, self.n_embd)?;
-        let graph = stream.capture(|| {
-            if embed_on_device {
-                self.embed(work, token)?;
-            }
-            self.queue_layers(work, Flow::Commit)?;
+        let mut head = |work: &mut Work| {
             let s = &mut work.scratch;
             self.queue_head(s, 0..1)?;
-            // SAFETY: the step owns both buffers with its graph, and they are
-            // read only after the stream has passed each launch.
+            // SAFETY: the step owns both buffers with its graphs, and they
+            // are read only after the stream has passed each launch.
             unsafe {
                 greedy.download(0, s.greedy.best(), 0..1, stream)?;
                 hidden.download(0, s.h.values(), 0..self.n_embd, stream)
             }
-        })?;
+        };
+        if self.shards.is_empty() {
+            let graph = stream.capture(|| {
+                if embed_on_device {
+                    self.embed(work, token)?;
+                }
+                self.queue_layers(work, Flow::Commit)?;
+                head(work)
+            })?;
+            return Ok(Step {
+                graphs: vec![graph],
+                greedy,
+                hidden,
+            });
+        }
+        let mut graphs = vec![stream.capture(|| {
+            if embed_on_device {
+                self.embed(work, token)?;
+            }
+            self.queue_main(work, Flow::Commit)
+        })?];
+        for (k, shard) in self.shards.iter().enumerate() {
+            // queued now, outside the graph, so the shard's batch holds this
+            // step's one token when its launches are recorded
+            self.hand_to_shard(work, k)?;
+            graphs.push(
+                shard
+                    .gpu
+                    .stream
+                    .capture(|| self.queue_shard(work, k, Flow::Commit))?,
+            );
+        }
+        self.hand_back(work)?;
+        graphs.push(stream.capture(|| head(work))?);
         Ok(Step {
-            graph,
+            graphs,
             greedy,
             hidden,
         })
+    }
+
+    /// Replays `step` on the batch in `work`: its graphs in turn, with the
+    /// hand-overs between devices queued between them.
+    fn launch_step(&self, step: &Step, work: &mut Work) -> kinetic_cuda::Result<()> {
+        let stream = &self.gpu.stream;
+        let [main, rest @ ..] = step.graphs.as_slice() else {
+            unreachable!("a step has a graph")
+        };
+        main.launch(stream)?;
+        let Some((head, shards)) = rest.split_last() else {
+            return Ok(());
+        };
+        for (k, graph) in shards.iter().enumerate() {
+            self.hand_to_shard(work, k)?;
+            graph.launch(&self.shards[k].gpu.stream)?;
+        }
+        self.hand_back(work)?;
+        head.launch(stream)
     }
 
     /// Runs `tokens` in passes of up to [`PASS_ROWS`] and the head on the
@@ -940,6 +992,16 @@ impl<'m> CudaModel<'m> {
     /// the scratch: those of the main device, then those of each shard, the
     /// stream handed from device to device and its norm back for the head.
     fn queue_layers(&self, work: &mut Work, flow: Flow) -> kinetic_cuda::Result<()> {
+        self.queue_main(work, flow)?;
+        for k in 0..self.shards.len() {
+            self.hand_to_shard(work, k)?;
+            self.queue_shard(work, k, flow)?;
+        }
+        self.hand_back(work)
+    }
+
+    /// Queues the main device's layers over the batch in `work`.
+    fn queue_main(&self, work: &mut Work, flow: Flow) -> kinetic_cuda::Result<()> {
         let n = work.batch.len();
         let s = &mut work.scratch;
         if let Some(p) = &self.per_layer {
@@ -950,29 +1012,51 @@ impl<'m> CudaModel<'m> {
             Some(next) => next.entry_norm.as_ref(),
             None => Some(&self.output_norm),
         };
-        self.queue_run(&self.gpu, &self.layers, work, flow, last)?;
-        for (k, shard) in self.shards.iter().enumerate() {
-            let (before, after) = work.shards.split_at_mut(k);
-            let to = &mut after[0];
-            let (from, batch, src) = match before.last() {
-                Some(w) => (&self.shards[k - 1].gpu, &w.batch, &w.scratch),
-                None => (&self.gpu, &work.batch, &work.scratch),
-            };
-            hand_over(from, &shard.gpu, n, self.n_embd, batch, src, to)?;
-            let last = match self.shards.get(k + 1) {
-                Some(next) => next.entry_norm.as_ref(),
-                None => Some(&shard.output_norm),
-            };
-            self.queue_run(&shard.gpu, &shard.layers, to, flow, last)?;
-        }
-        if let (Some(shard), Some(w)) = (self.shards.last(), work.shards.last()) {
-            shard.gpu.handoff.record(&shard.gpu.stream)?;
-            self.gpu.stream.wait(&shard.gpu.handoff)?;
-            work.scratch
-                .h
-                .copy_rows_from(0, &w.scratch.h, 0..n, &self.gpu.stream)?;
-        }
-        Ok(())
+        self.queue_run(&self.gpu, &self.layers, work, flow, last)
+    }
+
+    /// Queues the copies of the batch, the stream and its norm from the
+    /// device before shard `k` to the shard's buffers in `work`.
+    fn hand_to_shard(&self, work: &mut Work, k: usize) -> kinetic_cuda::Result<()> {
+        let n = work.batch.len();
+        let (before, after) = work.shards.split_at_mut(k);
+        let (from, batch, src) = match before.last() {
+            Some(w) => (&self.shards[k - 1].gpu, &w.batch, &w.scratch),
+            None => (&self.gpu, &work.batch, &work.scratch),
+        };
+        hand_over(
+            from,
+            &self.shards[k].gpu,
+            n,
+            self.n_embd,
+            batch,
+            src,
+            &mut after[0],
+        )
+    }
+
+    /// Queues shard `k`'s layers over its batch in `work`.
+    fn queue_shard(&self, work: &mut Work, k: usize, flow: Flow) -> kinetic_cuda::Result<()> {
+        let shard = &self.shards[k];
+        let last = match self.shards.get(k + 1) {
+            Some(next) => next.entry_norm.as_ref(),
+            None => Some(&shard.output_norm),
+        };
+        self.queue_run(&shard.gpu, &shard.layers, &mut work.shards[k], flow, last)
+    }
+
+    /// Queues the copy of the last shard's normalized stream back to the
+    /// main device, for the head; nothing without shards.
+    fn hand_back(&self, work: &mut Work) -> kinetic_cuda::Result<()> {
+        let (Some(shard), Some(w)) = (self.shards.last(), work.shards.last()) else {
+            return Ok(());
+        };
+        let n = work.batch.len();
+        shard.gpu.handoff.record(&shard.gpu.stream)?;
+        self.gpu.stream.wait(&shard.gpu.handoff)?;
+        work.scratch
+            .h
+            .copy_rows_from(0, &w.scratch.h, 0..n, &self.gpu.stream)
     }
 
     /// Queues `layers` on `gpu` over the batch in `work`, whose `h` holds
