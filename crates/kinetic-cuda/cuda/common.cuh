@@ -14,6 +14,24 @@ struct Words {
     int w[4];
 };
 
+// Four signed int8 products of a and b added to c, as __dp4a. sm_60 (GP100)
+// has no dp4a instruction, so it adds the same products in integer
+// arithmetic, which gives the same bits.
+__device__ __forceinline__ int dp4a(int a, int b, int c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+    const int p0 = ((a << 24) >> 24) * ((b << 24) >> 24);
+    const int p1 = ((a << 16) >> 24) * ((b << 16) >> 24);
+    const int p2 = ((a << 8) >> 24) * ((b << 8) >> 24);
+    const int p3 = (a >> 24) * (b >> 24);
+    // Wrapping adds, as the instruction's.
+    return static_cast<int>(static_cast<unsigned>(c) + static_cast<unsigned>(p0) +
+                            static_cast<unsigned>(p1) + static_cast<unsigned>(p2) +
+                            static_cast<unsigned>(p3));
+#else
+    return __dp4a(a, b, c);
+#endif
+}
+
 // Weights are streamed once per call; evict-first keeps the reused input
 // vector resident in L1.
 __device__ __forceinline__ Words load_weights(const void* p) {
@@ -97,7 +115,7 @@ __device__ __forceinline__ void gemv_rows(const uint8_t* w, In x, float* y, unsi
 // Four signed int8 dot products of 16 values, added to `acc`.
 __device__ __forceinline__ int dot16(const Words& a, const Words& b, int acc = 0) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) acc = __dp4a(a.w[i], b.w[i], acc);
+    for (int i = 0; i < 4; ++i) acc = dp4a(a.w[i], b.w[i], acc);
     return acc;
 }
 

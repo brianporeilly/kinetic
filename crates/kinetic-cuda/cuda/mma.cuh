@@ -2,6 +2,17 @@
 
 #include "common.cuh"
 
+// Below sm_75 there are no tensor-core instructions this file can use. The
+// kernels that need them are still compiled, so that every module has the
+// same functions, but kernels.rs never launches them on such devices; if
+// one is launched anyway it stops with an error rather than computing
+// garbage.
+__device__ __forceinline__ void no_tensor_cores() {
+#if __CUDA_ARCH__ < 750
+    __trap();
+#endif
+}
+
 // Integer tensor-core products. sm_80 and up have m16n8k32 and m16n8k16
 // directly; Turing (sm_75) has only m8n8k16, and four of those (two for k16)
 // cover the same fragments: rows g and g + 8 are the two halves of A and of
@@ -14,7 +25,7 @@ __device__ __forceinline__ void mma_k32(int (&d)[4], int a0, int a1, int a2, int
         "{%8,%9}, {%0,%1,%2,%3};"
         : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-#else
+#elif __CUDA_ARCH__ >= 750
     asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
         : "+r"(d[0]), "+r"(d[1])
         : "r"(a0), "r"(b0));
@@ -27,6 +38,8 @@ __device__ __forceinline__ void mma_k32(int (&d)[4], int a0, int a1, int a2, int
     asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
         : "+r"(d[2]), "+r"(d[3])
         : "r"(a3), "r"(b1));
+#else
+    no_tensor_cores();
 #endif
 }
 
@@ -36,13 +49,15 @@ __device__ __forceinline__ void mma_k16(int (&d)[4], int a0, int a1, int b0) {
         "{%0,%1,%2,%3};"
         : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
         : "r"(a0), "r"(a1), "r"(b0));
-#else
+#elif __CUDA_ARCH__ >= 750
     asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
         : "+r"(d[0]), "+r"(d[1])
         : "r"(a0), "r"(b0));
     asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
         : "+r"(d[2]), "+r"(d[3])
         : "r"(a1), "r"(b0));
+#else
+    no_tensor_cores();
 #endif
 }
 
@@ -81,16 +96,26 @@ __device__ __forceinline__ unsigned shared_addr(const void* p) {
 // giving the row addresses of matrix i; lane (g, t) receives elements 2t
 // and 2t + 1 of row g of each, the layout of mma fragments.
 __device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], const void* p) {
+#if __CUDA_ARCH__ >= 750
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(shared_addr(p)));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0;
+    no_tensor_cores();
+#endif
 }
 
 // The same of the transposed matrices.
 __device__ __forceinline__ void ldsm_x4_trans(unsigned (&r)[4], const void* p) {
+#if __CUDA_ARCH__ >= 750
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(shared_addr(p)));
+#else
+    r[0] = r[1] = r[2] = r[3] = 0;
+    no_tensor_cores();
+#endif
 }
 
 // Two floats rounded to f16, the first in the low half.
@@ -124,7 +149,7 @@ __device__ __forceinline__ void mma_f16(float (&d)[4], unsigned a0, unsigned a1,
         "{%8,%9}, {%0,%1,%2,%3};"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-#else
+#elif __CUDA_ARCH__ >= 750
     asm("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
         "{%0,%1,%2,%3};"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
@@ -133,5 +158,7 @@ __device__ __forceinline__ void mma_f16(float (&d)[4], unsigned a0, unsigned a1,
         "{%0,%1,%2,%3};"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a2), "r"(a3), "r"(b1));
+#else
+    no_tensor_cores();
 #endif
 }

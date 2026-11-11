@@ -543,7 +543,7 @@ checks every hash and the signature. Format: [FORMAT.md](crates/kinetic-ktc/FORM
 
 | | CPU | NVIDIA (CUDA) | Vulkan |
 |---|---|---|---|
-| Hardware | x86-64 with AVX2 | RTX 20, GTX 16, newer | AMD, Intel, NVIDIA |
+| Hardware | x86-64 with AVX2 | GTX 10, P100, newer | AMD, Intel, NVIDIA |
 | Models | all | all text models | Llama, Qwen, LFM3 |
 | Bigger than the GPU | | layer split, MoE offload | coming |
 | Needs | nothing | the NVIDIA driver | the graphics driver |

@@ -13,6 +13,14 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
 - LFM2.5 mixture of experts (`lfm2moe`), experimental, on the CPU and CUDA,
   with experts kept in system memory when they do not fit the GPU.
 
+### Devices
+
+- NVIDIA Pascal (GTX 10 series, Tesla P100, sm_60 and sm_61) and Volta
+  (sm_70) through CUDA. Without the tensor cores the prompt kernels use,
+  prompts run 16 tokens at a time; generation runs the same kernels as on
+  newer GPUs. `KINETIC_CUDA_ARCHS` (`CUDA_ARCHS` in `Dockerfile.cuda`) builds
+  the kernels for chosen GPUs only.
+
 ## [0.1.0] - 2026-11-05
 
 The first public release.

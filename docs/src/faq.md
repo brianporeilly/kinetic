@@ -58,8 +58,8 @@ the CPU, the GPU is not usable:`. The common ones:
   model), or use a smaller quantization.
 - **The model uses something the GPU code does not have yet**, such as an
   architecture Vulkan does not run yet. These run on the CPU for now.
-- **The GPU is older than Turing** (GTX 10 series and earlier). These are not
-  supported.
+- **The GPU is older than Pascal** (GTX 900 series and earlier). These are
+  not supported.
 
 `--device cuda` turns any of these into an error instead of a fallback.
 

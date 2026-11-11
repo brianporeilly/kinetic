@@ -94,6 +94,20 @@ docker build -f docker/Dockerfile.cuda -t kinetic:cuda .
 docker run --rm --gpus all -p 8080:8080 -v "$PWD/models:/models:ro" kinetic:cuda /models/model.gguf
 ```
 
+`--build-arg CUDA_ARCHS="60;61"` builds the kernels for those compute
+capabilities only (here Tesla P100 and GTX 10 series), which is much faster
+than building for every GPU from Pascal on.
+
+With Podman, the NVIDIA Container Toolkit's CDI devices take the place of
+`--gpus all`; on hosts where SELinux is enforcing, such as Fedora, the
+container also needs SELinux labels turned off to open the GPU:
+
+```sh
+podman build -f docker/Dockerfile.cuda --build-arg CUDA_ARCHS="60;61" -t kinetic:cuda .
+podman run --rm --device nvidia.com/gpu=all --security-opt=label=disable \
+  -p 8080:8080 -v "$PWD/models:/models:ro" kinetic:cuda /models/model.gguf
+```
+
 Inside the container the server listens on all interfaces, so that
 `-p 8080:8080` reaches it; `-p 127.0.0.1:8080:8080` keeps it on your own
 machine. Arguments after the image name go to `kinetic serve`, so

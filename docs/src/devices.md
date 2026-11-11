@@ -55,9 +55,17 @@ with `kinetic bench model.gguf --device cpu -t N`.
 
 ## NVIDIA GPUs
 
-GPUs from the Turing generation (RTX 20 series, GTX 16 series) on are
-supported, with kernels for compute capability 7.5, 8.0, 8.6, 8.9, 9.0 and
-12.0, and PTX that newer drivers compile for later GPUs.
+GPUs from the Pascal generation (GTX 10 series, Tesla P100) on are
+supported, with kernels for compute capability 6.0, 6.1, 7.0, 7.5, 8.0, 8.6,
+8.9, 9.0 and 12.0, and PTX that newer drivers compile for later GPUs.
+
+Pascal and Volta (compute capability 6.x and 7.0) have none of the tensor
+cores the prompt kernels use. Prompts run there 16 tokens at a time through
+the generation kernels, so long prompts take noticeably longer than on
+Turing and newer; generation runs the same kernels as on newer GPUs. The
+Tesla P100 (6.0) also lacks the int8 dot product instruction, which its
+kernels do in plain integer arithmetic, with the same results and less
+speed.
 
 Kinetic opens the driver library at runtime (`nvcuda.dll` on Windows,
 `libcuda.so.1` on Linux) and links nothing from the CUDA toolkit, so:

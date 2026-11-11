@@ -131,8 +131,8 @@ __device__ __forceinline__ int iq1_group(const Words (&q)[2], const Words (&a)[2
     const Words& w = q[g / 2];
     const Words& x = a[g / 2];
     const unsigned i = 2 * (g % 2);
-    const int values = __dp4a(w.w[i], x.w[i], __dp4a(w.w[i + 1], x.w[i + 1], 0));
-    const int sum = __dp4a(0x01010101, x.w[i], __dp4a(0x01010101, x.w[i + 1], 0));
+    const int values = dp4a(w.w[i], x.w[i], dp4a(w.w[i + 1], x.w[i + 1], 0));
+    const int sum = dp4a(0x01010101, x.w[i], dp4a(0x01010101, x.w[i + 1], 0));
     return 8 * values + (negative ? -sum : sum);
 }
 

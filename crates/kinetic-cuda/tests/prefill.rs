@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{gpu, Gpu, Lcg};
+use common::{gpu, large_batch_gpu, Gpu, Lcg};
 use kinetic_cuda::{
     AttentionIo, AttentionParams, AttentionShape, Batch, ConvState, DeltaIo, DeltaParams,
     DeltaShape, DeltaState, DeviceBuffer, Flow, GemvInput, KvCache, KvType, MAX_BATCH,
@@ -126,7 +126,7 @@ fn attention_outputs(
 }
 
 fn check_attention(shape: AttentionShape) {
-    let Some(gpu) = gpu() else { return };
+    let Some(gpu) = large_batch_gpu() else { return };
     let f16 = [KvType::F16; 2];
     let steps = attention_outputs(&gpu, shape, f16, false);
     let batched = attention_outputs(&gpu, shape, f16, true);
@@ -171,7 +171,7 @@ fn windowed_flash_attention_matches_steps() {
 
 #[test]
 fn q8_0_cache_stays_close_to_f16() {
-    let Some(gpu) = gpu() else { return };
+    let Some(gpu) = large_batch_gpu() else { return };
     for shape in [
         attention_shape(256, None, true),
         attention_shape(64, Some(40), false),
@@ -215,7 +215,7 @@ fn q8_0_cache_saves_and_loads_unchanged() {
 
 #[test]
 fn chunked_delta_rule_matches_steps() {
-    let Some(gpu) = gpu() else { return };
+    let Some(gpu) = large_batch_gpu() else { return };
     let shape = DeltaShape {
         n_k_heads: 2,
         n_v_heads: 4,

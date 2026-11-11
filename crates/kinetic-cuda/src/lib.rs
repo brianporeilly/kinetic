@@ -3,7 +3,7 @@
 //! The driver is loaded at runtime (`nvcuda.dll` or `libcuda.so.1`), so this
 //! crate builds and links on machines without CUDA; every entry point then
 //! returns an [`Error`] instead. Kernels are compiled by nvcc at build time
-//! into one fatbin with machine code for sm_75 through sm_120 and PTX for
+//! into one fatbin with machine code for sm_60 through sm_120 and PTX for
 //! newer GPUs. Built without nvcc, [`Kernels::load`] fails with
 //! [`Error::KernelsNotBuilt`].
 //!

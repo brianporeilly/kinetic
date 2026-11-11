@@ -257,6 +257,10 @@ fn gated_product_matches_separate_products() {
         let ran = k
             .glu_matmul(&gate, &up, gelu, &input, 0..n, &mut fused, &gpu.stream)
             .unwrap();
+        if !ran && !gpu.ctx.device().info().unwrap().tensor_cores() {
+            eprintln!("skipped: the device has no tiled products");
+            return;
+        }
         assert!(ran, "{ty}: no gated product kernel");
 
         let mut g = DeviceBuffer::new(&gpu.ctx, n * rows).unwrap();

@@ -364,11 +364,11 @@ __device__ void moe_rows(const MoeParams& p) {
                     if (t >= count) break;
                     const int* x = reinterpret_cast<const int*>(xs + t * p.cols + b * QK_IQ + 8 * lane);
                     const float xd = ds[t * blocks + b];
-                    const int sum = warp_isum(l.mul * __dp4a(l.w[1], x[1], __dp4a(l.w[0], x[0], 0)));
+                    const int sum = warp_isum(l.mul * dp4a(l.w[1], x[1], dp4a(l.w[0], x[0], 0)));
                     acc[m][t] = __fadd_rn(acc[m][t], __fmul_rn(__fmul_rn(wd, xd), static_cast<float>(sum)));
                     if (F::MINS && wmin != 0.0f) {
                         const int ones = 0x01010101;
-                        const int offsets = warp_isum(l.min * __dp4a(ones, x[1], __dp4a(ones, x[0], 0)));
+                        const int offsets = warp_isum(l.min * dp4a(ones, x[1], dp4a(ones, x[0], 0)));
                         acc[m][t] = __fsub_rn(acc[m][t],
                                               __fmul_rn(__fmul_rn(wmin, xd), static_cast<float>(offsets)));
                     }

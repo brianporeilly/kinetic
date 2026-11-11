@@ -414,6 +414,11 @@ impl Kernels {
                 "{n} tokens of {s:?} in one pass need committed value heads of {HEAD_K_DIM}"
             )));
         }
+        if !self.tensor_cores {
+            return Err(Error::Shape(format!(
+                "{n} tokens in one pass need tensor cores; this device takes at most {MAX_BATCH}"
+            )));
+        }
 
         let mut args = DeltaArgs::new(&params, state, n, 0);
         args.batch = batch.device_ptr();

@@ -92,7 +92,8 @@ fn tiles(ty: TensorType) -> &'static [Tile] {
 /// The matrix-product kernels of `module`, by index into `WEIGHT_TYPES` and
 /// then by width, allowed the shared memory they take; none for a type
 /// without a tiled kernel or where the device has less shared memory
-/// (Turing), so those batches run as GEMVs.
+/// (Turing), so those batches run as GEMVs. Every kernel here needs tensor
+/// cores; `Kernels::load` does not call this on devices without.
 pub(crate) fn gemm_functions(module: &Rc<Module>) -> Result<Vec<Vec<Function>>> {
     WEIGHT_TYPES
         .iter()

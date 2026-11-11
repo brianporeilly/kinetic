@@ -36,8 +36,17 @@ On Windows, `nvcc` needs `cl.exe`. From a plain shell, the build finds the
 newest MSVC toolset through `vswhere` and passes it to `nvcc`, so a developer
 prompt is not required.
 
-The kernels are compiled for every NVIDIA architecture from Turing (sm_75) to
+The kernels are compiled for every NVIDIA architecture from Pascal (sm_60) to
 Blackwell (sm_120), plus PTX that newer drivers can compile for later GPUs.
+`KINETIC_CUDA_ARCHS` builds for chosen compute capabilities only, which is
+much faster, with PTX for the last of them:
+
+```sh
+KINETIC_CUDA_ARCHS="60;61" cargo build --release -p kinetic-cli --features cuda
+```
+
+Pascal and Volta (sm_60 to sm_70) need CUDA 12; CUDA 13 no longer builds
+for them.
 
 Install the binary into `~/.cargo/bin`:
 

@@ -18,6 +18,8 @@ const WARPS: u32 = 8;
 const QUERIES: u32 = 8;
 const TILE: usize = 32;
 const MAX_HEAD: usize = 128;
+/// Shared bytes any block may take without opting in.
+const DEFAULT_SHARED: u32 = 48 * 1024;
 
 /// Inputs and weight rows of one block of [`VisionKernels::matmul`], and
 /// the columns it takes a step.
@@ -41,6 +43,12 @@ pub struct VisionKernels {
     attention: Function,
     attention_mma: Function,
     matmul: Function,
+    /// See [`DeviceInfo::tensor_cores`](crate::DeviceInfo::tensor_cores):
+    /// without, attention and products take the kernels that do without.
+    tensor_cores: bool,
+    /// The widest head [`VisionKernels::attention`] takes without tensor
+    /// cores: [`MAX_HEAD`] where the device gives a block the shared memory.
+    max_head: usize,
 }
 
 fn check(ok: bool, what: impl FnOnce() -> String) -> Result<()> {
@@ -60,7 +68,16 @@ impl VisionKernels {
         // SAFETY: the image is nvcc's fatbin output, embedded unchanged.
         let module = unsafe { Module::load(ctx, &IMAGE.0) }?;
         let attention = module.function(c"vit_attention")?;
-        attention.allow_shared(attention_shared(MAX_HEAD))?;
+        // Pascal allows a block no more than the default 48 KiB of shared
+        // memory, too little for heads of MAX_HEAD; narrower heads still fit.
+        let max_head = match attention.allow_shared(attention_shared(MAX_HEAD)) {
+            Ok(()) => MAX_HEAD,
+            Err(_) => (8..=MAX_HEAD)
+                .rev()
+                .step_by(8)
+                .find(|&h| attention_shared(h) <= DEFAULT_SHARED)
+                .unwrap_or(0),
+        };
         Ok(VisionKernels {
             layer_norm: module.function(c"vit_layer_norm")?,
             bias: module.function(c"vit_bias")?,
@@ -72,6 +89,8 @@ impl VisionKernels {
             attention,
             attention_mma: module.function(c"vit_attention_mma")?,
             matmul: module.function(c"vit_matmul")?,
+            tensor_cores: ctx.device().info()?.tensor_cores(),
+            max_head,
         })
     }
 
@@ -402,11 +421,13 @@ impl VisionKernels {
     ) -> Result<()> {
         let width = n_head * head_dim;
         check(
-            qkv.len() >= rows * 3 * width && head_dim <= MAX_HEAD && out.width() == width,
+            qkv.len() >= rows * 3 * width
+                && (head_dim <= self.max_head || head_dim == MMA_HEAD && self.tensor_cores)
+                && out.width() == width,
             || format!("attention of {rows} rows of {n_head} heads of {head_dim}"),
         )?;
         out.check_rows(rows)?;
-        if head_dim == MMA_HEAD {
+        if head_dim == MMA_HEAD && self.tensor_cores {
             let config = LaunchConfig {
                 grid: [(rows as u32).div_ceil(MMA_QUERIES), n_head as u32, 1],
                 block: [MMA_THREADS, 1, 1],
@@ -462,7 +483,8 @@ impl VisionKernels {
 
     /// Queues `y = x w^T` for the first `rows` inputs of `x`: on the tensor
     /// cores with the inputs rounded to f16 for f16 weights, through
-    /// [`Kernels::gemv_rows`] for other types.
+    /// [`Kernels::gemv_rows`] for other types and on devices without tensor
+    /// cores.
     pub fn matmul(
         &self,
         kernels: &Kernels,
@@ -473,7 +495,11 @@ impl VisionKernels {
         stream: &Stream,
     ) -> Result<()> {
         let (n, k) = (w.rows(), w.cols());
-        if w.ty() != TensorType::F16 || !n.is_multiple_of(2) || !k.is_multiple_of(MM_STEP) {
+        if !self.tensor_cores
+            || w.ty() != TensorType::F16
+            || !n.is_multiple_of(2)
+            || !k.is_multiple_of(MM_STEP)
+        {
             return kernels.gemv_rows(w, n, x, 0..rows, y, stream);
         }
         check(x.width() == k && y.len() >= rows * n, || {

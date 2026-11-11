@@ -10,6 +10,18 @@ pub struct Gpu {
     pub stream: Stream,
 }
 
+/// [`gpu`] where the device runs batches of more than `MAX_BATCH` tokens in
+/// one pass, which takes tensor cores and enough shared memory.
+#[allow(dead_code)] // not every test file uses it
+pub fn large_batch_gpu() -> Option<Gpu> {
+    let gpu = gpu()?;
+    if !gpu.kernels.large_batches() {
+        eprintln!("skipped: the device has no large-batch kernels");
+        return None;
+    }
+    Some(gpu)
+}
+
 pub fn gpu() -> Option<Gpu> {
     match Device::count() {
         Ok(n) if n > 0 => {}

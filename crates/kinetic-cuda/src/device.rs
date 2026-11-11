@@ -33,6 +33,14 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
+    /// Whether the device has the tensor-core instructions the kernels use
+    /// (Turing, sm_75, and up). Without them, as on Pascal and Volta, only
+    /// the kernels that do without run: GEMVs for every product and batches
+    /// of at most [`crate::MAX_BATCH`] tokens.
+    pub fn tensor_cores(&self) -> bool {
+        self.compute_capability >= (7, 5)
+    }
+
     /// Nominal DRAM bandwidth in bytes per second: two transfers per reported
     /// memory clock across the whole bus.
     pub fn peak_bandwidth(&self) -> Option<f64> {

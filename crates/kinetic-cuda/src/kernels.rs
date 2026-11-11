@@ -77,6 +77,8 @@ pub struct Kernels {
     pub(crate) moe_assign: Function,
     read_sum: Function,
     pub(crate) multiprocessors: u32,
+    /// See [`DeviceInfo::tensor_cores`](crate::DeviceInfo::tensor_cores).
+    pub(crate) tensor_cores: bool,
 }
 
 impl Kernels {
@@ -106,12 +108,19 @@ impl Kernels {
                 ])
             })
             .transpose()?;
-        let gemm = gemm_functions(&module)?;
+        // The tiled products and flash attention run on tensor cores; without
+        // them every product is a GEMV and batches go MAX_BATCH at a time.
+        let tensor_cores = info.tensor_cores();
+        let gemm = match tensor_cores {
+            true => gemm_functions(&module)?,
+            false => WEIGHT_TYPES.iter().map(|_| Vec::new()).collect(),
+        };
         let attn_flash = module.function(c"attn_flash")?;
-        let attn_flash = attn_flash
-            .allow_shared(FLASH_HEADS.into_iter().map(flash_shared).max().unwrap_or(0))
-            .is_ok()
-            .then_some(attn_flash);
+        let attn_flash = (tensor_cores
+            && attn_flash
+                .allow_shared(FLASH_HEADS.into_iter().map(flash_shared).max().unwrap_or(0))
+                .is_ok())
+        .then_some(attn_flash);
         let moe = |prefix: &str| -> Result<[Function; EXPERT_TYPES.len()]> {
             let named = |ty: &str| {
                 module.function(
@@ -174,6 +183,7 @@ impl Kernels {
             moe_assign: module.function(c"moe_assign")?,
             read_sum: module.function(c"read_sum")?,
             multiprocessors: info.multiprocessors,
+            tensor_cores,
         })
     }
 
