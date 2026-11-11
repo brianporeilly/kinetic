@@ -24,12 +24,32 @@ fn batches_and_rollbacks_change_no_bit() {
     let file = GgufFile::open(&path).unwrap();
     let model = kinetic_models::load(&file).unwrap();
     let gpu = CudaModel::load(&model, 64).unwrap();
+    let whole = logits(&gpu);
     a_batch_matches_token_by_token(&gpu);
     rollback_leaves_the_state_as_if_never_run(&gpu);
     a_host_copy_restores_the_state(&gpu, &model);
     shared_passes_match_running_alone(&gpu);
     let full = gpu.weight_bytes();
     drop(gpu);
+
+    // The layers over two devices: device 0 twice, which runs every copy
+    // and hand-over between them, and devices 0 and 1 where there are two.
+    let two = kinetic_cuda::Device::count().unwrap_or(0) >= 2;
+    for devices in [vec![0, 0], vec![0, 1]]
+        .into_iter()
+        .filter(|d| two || d[1] == 0)
+    {
+        let placement = Placement {
+            devices: devices.clone(),
+            ..Placement::default()
+        };
+        let spread = CudaModel::load_with(&model, 64, placement).unwrap();
+        assert_eq!(spread.device_split().len(), 2, "{devices:?}");
+        assert_eq!(logits(&spread), whole, "{devices:?}");
+        a_batch_matches_token_by_token(&spread);
+        rollback_leaves_the_state_as_if_never_run(&spread);
+        a_host_copy_restores_the_state(&spread, &model);
+    }
 
     // Half the layers on the host, as when the device is too small.
     let layers = model.n_layers();
@@ -53,6 +73,16 @@ fn batches_and_rollbacks_change_no_bit() {
     assert!(capped.host_layers() > 0 && capped.host_layers() < layers);
     assert!(capped.weight_bytes() <= full / 2);
     a_batch_matches_token_by_token(&capped);
+}
+
+/// The logits after a prompt and then each of a few single tokens, as bits.
+fn logits(gpu: &CudaModel) -> Vec<u32> {
+    let mut state = gpu.new_state().unwrap();
+    let mut all = bits(&gpu.run(&mut state, &PROMPT, false).unwrap().logits);
+    for &t in &NEXT {
+        all.extend(bits(&gpu.run(&mut state, &[t], false).unwrap().logits));
+    }
+    all
 }
 
 fn a_batch_matches_token_by_token(gpu: &CudaModel) {

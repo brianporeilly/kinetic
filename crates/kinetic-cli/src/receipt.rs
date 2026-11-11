@@ -132,6 +132,8 @@ fn rerun_runtime(
         threads,
         device,
         gpu_layers: int("gpu-layers"),
+        // which GPUs hold the layers does not change the bits
+        gpus: Vec::new(),
         cache_dir: None,
         no_prompt_cache: true,
         cache_type_k: cache("cache-type-k")?,

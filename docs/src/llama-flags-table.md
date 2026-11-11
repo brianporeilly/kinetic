@@ -11,7 +11,7 @@
 | `-rea` | works, as `--reasoning` |
 | `-ngl`, `--n-gpu-layers` | works: `0` means `--device cpu`, any other number `--device cuda`, `all` as many as fit |
 | `-fa`, `--flash-attn`, `--jinja`, `--mmap`, `-cb`, `--cont-batching`, `-nocb`, `--no-cont-batching`, `--no-warmup`, `--metrics`, `--slots`, `--no-webui`, `--embedding`, `--embeddings`, `-no-cnv`, `--no-conversation`, `-st`, `--single-turn`, `-b`, `--batch-size`, `-ub`, `--ubatch-size`, `-tb`, `--threads-batch`, `--cache-reuse`, `--numa`, `--prio`, `--poll`, `-to`, `--timeout`, `--threads-http` | accepted and not needed: Kinetic does this by itself |
-| `-sm`, `--split-mode`, `-ts`, `--tensor-split`, `-mg`, `--main-gpu`, `-ot`, `--override-tensor` | Kinetic runs the model wholly on one device; choose it with `--device` |
+| `-sm`, `--split-mode`, `-ts`, `--tensor-split`, `-mg`, `--main-gpu`, `-ot`, `--override-tensor` | Kinetic splits a model by layers only; choose the device with --device, and spread the layers over several CUDA GPUs with --gpus 0,1 |
 | `-cnv`, `--conversation`, `-i`, `--interactive`, `--interactive-first` | use `kinetic chat <model>` |
 | `--chat-template` | built-in template names are not supported; pass a Jinja file with --chat-template-file |
 | `-md`, `--model-draft`, `--draft`, `--draft-max`, `--draft-min`, `-ngld` | speculative decoding is automatic and needs no draft model |

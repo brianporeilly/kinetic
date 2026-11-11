@@ -74,8 +74,8 @@ Kinetic opens the driver library at runtime (`nvcuda.dll` on Windows,
 - the `cuda` build starts on machines without a GPU and runs on the CPU.
 
 Use a recent driver; the kernels are built with CUDA 12.8, and `nvidia-smi`
-shows the highest CUDA version your driver supports in its header. Only the
-first GPU is used; two GPUs are [coming](roadmap.md).
+shows the highest CUDA version your driver supports in its header. The first
+GPU is used unless `--gpus` names others; see [Several GPUs](#several-gpus).
 
 ## Vulkan
 
@@ -99,6 +99,35 @@ crosses between the two. The status line says how the model was split:
 `--gpu-layers N` puts at most `N` layers on the GPU, as llama.cpp's `-ngl N`
 does; use it to leave GPU memory for other programs. This works through
 CUDA; on Vulkan a model runs wholly on the GPU or on the CPU.
+
+## Several GPUs
+
+`--gpus 0,1` spreads a dense model's layers over CUDA GPUs 0 and 1 (in CUDA's
+order, which `kinetic doctor` lists): the first GPU holds the embeddings, the
+output head and the first run of layers, each further GPU the run after, each
+taking a share of the layers as large as its share of the free memory. Per
+token only the hidden state and its norm, a few kilobytes, cross from one GPU
+to the next and back to the first for the head, so the GPUs need no NVLink;
+where they have direct access to each other's memory it is used, otherwise
+the driver copies through system memory.
+
+```sh
+kinetic run model.gguf --gpus 0,1 "Explain this file."
+kinetic serve model.gguf --gpus 0,1
+kinetic bench model.gguf --gpus 0,1
+```
+
+The status line names each GPU with the number of layers it holds. The GPUs run one after the other, so a single answer is as fast as one GPU
+holding the whole model would make it: the gain is room. A model that would
+spill layers to the CPU on one GPU runs wholly on two, and the answer is the
+same, bit for bit, as on one GPU of the same kind. Layers that still do not
+fit run on the CPU, and `--gpu-layers` counts the layers over all GPUs.
+
+For now, `--gpus` takes dense models without per-layer inputs or shared
+attention caches (not mixture-of-experts models or Gemma 4 E2B/E4B), leaves
+out the drafts of a model's own prediction block (drafts from lookups still
+run), and runs the requests of `--parallel` one after another rather than
+in shared passes.
 
 ## Memory
 
@@ -153,6 +182,8 @@ GPU too.
 
 - **More on Vulkan**: more architectures, speculative decoding, Warm Start
   and layer splits.
-- **Two GPUs.**
+- **Several GPUs** for mixture-of-experts models, Gemma 4 E2B/E4B,
+  prediction-block drafts and shared passes; dense models already spread over
+  them with `--gpus`.
 
 See the [roadmap](roadmap.md).

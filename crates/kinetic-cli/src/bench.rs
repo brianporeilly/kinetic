@@ -82,6 +82,7 @@ pub fn run(
     path: &Path,
     name: &str,
     device: Device,
+    gpus: &[usize],
     tests: Tests,
     off: &[Tech],
     as_json: bool,
@@ -101,7 +102,7 @@ pub fn run(
     // The backend's name and the device's.
     let context = CONTEXT + tests.depth;
     let eager = off.contains(&Tech::Torque);
-    let picked = gpu::pick(device, |kind| plain(&model, kind, context, eager))?;
+    let picked = gpu::pick(device, |kind| plain(&model, kind, context, eager, gpus))?;
     let kind = picked.as_ref().map_or(Device::Cpu, |&(_, k)| k);
     let (backend, on, speeds) = match picked.map(|(p, _)| p) {
         #[cfg(feature = "cuda")]
@@ -110,6 +111,7 @@ pub fn run(
             let drafting = || {
                 let placement = kinetic_models::cuda::Placement {
                     eager,
+                    devices: gpus.to_vec(),
                     ..Default::default()
                 };
                 let gpu = kinetic_server::CudaBackend::with_placement(&model, context, placement)?;
@@ -243,12 +245,14 @@ fn plain<'a>(
     )]
     context: usize,
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] eager: bool,
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] gpus: &[usize],
 ) -> Option<std::result::Result<Plain<'a>, LoadError>> {
     match kind {
         #[cfg(feature = "cuda")]
         Device::Cuda => {
             let placement = kinetic_models::cuda::Placement {
                 eager,
+                devices: gpus.to_vec(),
                 ..Default::default()
             };
             Some(

@@ -94,6 +94,26 @@ impl Batch {
         unsafe { self.device.copy_range_from_async(0, &self.host, stream) }
     }
 
+    /// Queues a copy of `src`, a batch of another device or of the same
+    /// one, into this one on `stream`, which then holds the same tokens and
+    /// positions. The device copy reads what `src` holds when the stream
+    /// reaches it, so a recorded graph that copies the batch replays with
+    /// whatever `src` was set to before.
+    pub fn copy_from(&mut self, src: &Batch, stream: &Stream) -> Result<()> {
+        let len = src.host.len();
+        if src.len() > self.capacity {
+            return Err(Error::Shape(format!(
+                "batch of {} tokens into room for {}",
+                src.len(),
+                self.capacity
+            )));
+        }
+        // grid positions follow the ids, so a grid batch copies wholly
+        self.host.clone_from(&src.host);
+        self.grid_shift = src.grid_shift;
+        self.device.copy_from_device(0, &src.device, 0..len, stream)
+    }
+
     /// Tokens in the batch.
     pub fn len(&self) -> usize {
         match self.grid_shift {

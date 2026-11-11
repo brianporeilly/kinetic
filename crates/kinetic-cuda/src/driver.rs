@@ -75,6 +75,9 @@ entry_points! {
     memcpy_htod_async = "cuMemcpyHtoDAsync_v2"(CuDevicePtr, *const c_void, usize, CuStream);
     memcpy_dtoh_async = "cuMemcpyDtoHAsync_v2"(*mut c_void, CuDevicePtr, usize, CuStream);
     memcpy_dtod_async = "cuMemcpyDtoDAsync_v2"(CuDevicePtr, CuDevicePtr, usize, CuStream);
+    memcpy_async = "cuMemcpyAsync"(CuDevicePtr, CuDevicePtr, usize, CuStream);
+    device_can_access_peer = "cuDeviceCanAccessPeer"(*mut c_int, CuDevice, CuDevice);
+    ctx_enable_peer_access = "cuCtxEnablePeerAccess"(CuContext, c_uint);
     memset_d8 = "cuMemsetD8_v2"(CuDevicePtr, u8, usize);
     memset_d8_async = "cuMemsetD8Async"(CuDevicePtr, u8, usize, CuStream);
     mem_host_alloc = "cuMemHostAlloc"(*mut *mut c_void, usize, c_uint);

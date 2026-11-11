@@ -73,6 +73,8 @@ pub(super) struct Work {
     pub pass: Option<PassRows>,
     /// The states of the layers that run on the host.
     pub front: Vec<MixerState>,
+    /// The batch, scratch and layer states of each shard, on its device.
+    pub shards: Vec<Work>,
 }
 
 /// A batch and scratch for full prefill batches, lent to whichever state
@@ -80,6 +82,8 @@ pub(super) struct Work {
 pub(super) struct Spare {
     batch: Batch,
     scratch: Scratch,
+    /// Those of each shard.
+    shards: Vec<Spare>,
 }
 
 impl Spare {
@@ -87,6 +91,7 @@ impl Spare {
         Spare {
             batch: work.batch,
             scratch: work.scratch,
+            shards: work.shards.into_iter().map(Spare::new).collect(),
         }
     }
 
@@ -94,6 +99,9 @@ impl Spare {
     pub fn swap(&mut self, work: &mut Work) {
         std::mem::swap(&mut self.batch, &mut work.batch);
         std::mem::swap(&mut self.scratch, &mut work.scratch);
+        for (spare, w) in self.shards.iter_mut().zip(&mut work.shards) {
+            spare.swap(w);
+        }
     }
 }
 
@@ -186,11 +194,17 @@ impl Work {
             experts: None,
             pass: None,
             front: Vec::new(),
+            shards: Vec::new(),
         })
     }
 
-    /// Device bytes held.
+    /// Device bytes held, over every device.
     pub fn size_bytes(&self) -> usize {
+        self.own_bytes() + self.shards.iter().map(Work::size_bytes).sum::<usize>()
+    }
+
+    /// Device bytes held on this work's own device.
+    fn own_bytes(&self) -> usize {
         let s = &self.scratch;
         let input = |i: &GemvInput| i.capacity() * i.width() * 6;
         let buffers = s.x.len()

@@ -79,13 +79,31 @@ impl<'a> CudaBackend<'a> {
         context: usize,
         placement: Placement,
     ) -> Result<Self, LoadError> {
-        let name = kinetic_cuda::Device::get(0)
-            .and_then(|d| d.info())
-            .map_err(cuda_error)?
-            .name;
+        let ordinals = match placement.devices.as_slice() {
+            [] => vec![0],
+            d => d.to_vec(),
+        };
+        let names = ordinals
+            .iter()
+            .map(|&d| {
+                kinetic_cuda::Device::get(d)
+                    .and_then(|d| d.info())
+                    .map(|i| i.name)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(cuda_error)?;
         // slots on other threads share it, see the SAFETY note on Send
         #[allow(clippy::arc_with_non_send_sync)]
         let gpu = Arc::new(CudaModel::load_with(model, context, placement)?);
+        let name = match gpu.device_split().as_slice() {
+            [_] => names[0].clone(),
+            split => names
+                .iter()
+                .zip(split)
+                .map(|(name, n)| format!("{name} ({n} layers)"))
+                .collect::<Vec<_>>()
+                .join(" + "),
+        };
         let device = match gpu.host_layers() {
             0 => name,
             host => format!(

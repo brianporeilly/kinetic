@@ -74,7 +74,7 @@ const UNSUPPORTED: &[(&[&str], &str)] = &[
             "-ot",
             "--override-tensor",
         ],
-        "Kinetic runs the model wholly on one device; choose it with --device",
+        "Kinetic splits a model by layers only; choose the device with --device, and spread the layers over several CUDA GPUs with --gpus 0,1",
     ),
     (
         &[

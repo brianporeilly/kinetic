@@ -149,6 +149,7 @@ impl CudaModel<'_> {
         let since = state.checkpoint.map_or(0, |start| state.pos - start);
         self.offload.is_none()
             && self.front == 0
+            && self.shards.is_empty()
             && self.layers.iter().all(|l| l.mixer.widths().is_some())
             && self.check_tokens(run.tokens).is_ok()
             && run.tokens.len() <= MAX_BATCH

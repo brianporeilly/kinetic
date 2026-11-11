@@ -3,6 +3,10 @@
 //! A token's embedding goes through the host layers, and its hidden state
 //! is copied over to the device for the rest, so only `n_embd` values per
 //! token cross between them.
+//!
+//! With several devices, the layers after the main device's run on the
+//! others in turn, see [`Shard`](super::Shard); their stream and its input
+//! norm go over to each next device, and back to the main one for the head.
 
 use kinetic_cuda::KvType;
 
@@ -11,15 +15,18 @@ use super::layer::CudaLayer;
 use super::scratch::Work;
 use super::{cuda_error, CudaModel, Gpu};
 use crate::blocks::MixerState;
+use crate::model::Layer;
 use crate::{LoadError, Model};
 
 /// Limits on what of a model goes to the device, and how it runs there.
 /// The default puts as much there as fits and records decode steps.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Placement {
-    /// Most layers on the device, as llama.cpp's `-ngl` counts them.
+    /// Most layers on the device, as llama.cpp's `-ngl` counts them; over
+    /// all devices when there are several.
     pub gpu_layers: Option<usize>,
-    /// Most device bytes the model may take, weights and one state.
+    /// Most device bytes the model may take, weights and one state, on
+    /// each device.
     pub device_bytes: Option<usize>,
     /// Launch each kernel of a decode step on its own rather than replaying
     /// the recorded step: Torque off.
@@ -28,51 +35,120 @@ pub struct Placement {
     /// them and so changes outputs.
     pub cache_k: KvType,
     pub cache_v: KvType,
+    /// The CUDA devices to spread the layers over, by ordinal, in the order
+    /// the layers run; the first also holds the embeddings and the output
+    /// head. Empty means device 0 alone. A device may be named twice, which
+    /// splits the layers on it as if over two, for testing the split.
+    pub devices: Vec<usize>,
 }
 
-/// Uploads the longest run of `model`'s last layers that fits in the device
-/// beside one state of `context` positions in batches of `rows`, within
-/// `placement`; `start` is the free device memory before the model took
-/// any. Returns how many layers stay on the host and the device layers in
-/// order.
-pub(super) fn upload_layers(
+/// What [`upload_layers`] fits a run of layers beside.
+pub(super) struct Fit<'a> {
+    pub model: &'a Model<'a>,
+    pub context: usize,
+    pub rows: usize,
+    pub cap: usize,
+}
+
+/// Where the layers went: how many stay on the host, in front, then those
+/// on the main device and those on each further device, in order.
+pub(super) struct Split {
+    pub front: usize,
+    pub main: Vec<CudaLayer>,
+    pub shards: Vec<Vec<CudaLayer>>,
+}
+
+/// Uploads the model's layers over `gpu`, the main device, which already
+/// holds the embeddings and head, and `others`, each with the free memory it
+/// had before the model took any: the last layers to the last device, each
+/// device taking a share of them as large as its share of the free memory,
+/// up to what fits; the main device the run before theirs, and at least
+/// one; the host what is left.
+pub(super) fn upload_split(
     gpu: &Gpu,
-    model: &Model,
-    context: usize,
-    rows: usize,
+    start: usize,
+    others: &[(&Gpu, usize)],
+    fit: &Fit,
     vocab: usize,
-    placement: Placement,
+    placement: &Placement,
+) -> Result<Split, LoadError> {
+    let n = fit.model.layers.len();
+    let mut budget = placement.gpu_layers.unwrap_or(n).min(n);
+    let free = |g: &Gpu| g.ctx.memory_info().map(|(f, _)| f).map_err(cuda_error);
+    let mut frees = vec![free(gpu)?];
+    for (g, _) in others {
+        frees.push(free(g)?);
+    }
+    let total: usize = frees.iter().sum::<usize>().max(1);
+    let mut end = n;
+    let mut shards = Vec::new();
+    for (k, &(g, start)) in others.iter().enumerate().rev() {
+        let share = (budget as f64 * frees[k + 1] as f64 / total as f64).round() as usize;
+        // leave the main device a layer
+        let most = share.max(1).min(budget).min(end.saturating_sub(1));
+        let (rest, layers) = upload_layers(g, &fit.model.layers[..end], fit, most, 0, start)?;
+        if layers.is_empty() {
+            return Err(LoadError(format!("no layer fits on CUDA device {}", k + 2)));
+        }
+        budget -= layers.len();
+        end = rest;
+        shards.push(layers);
+    }
+    shards.reverse();
+    let (front, main) = upload_layers(gpu, &fit.model.layers[..end], fit, budget, vocab, start)?;
+    if main.is_empty() && n > 0 {
+        return Err(LoadError("no layer fits on the device".into()));
+    }
+    Ok(Split {
+        front,
+        main,
+        shards,
+    })
+}
+
+/// Uploads the longest run of the last of `layers` that fits in the device
+/// beside one state of `fit.context` positions in batches of `fit.rows`
+/// with `vocab` logits a row, at most `most` of them; `start` is the free
+/// device memory before the model took any. Returns how many of `layers`
+/// stay before them and the uploaded ones in order.
+fn upload_layers(
+    gpu: &Gpu,
+    layers: &[Layer],
+    fit: &Fit,
+    most: usize,
+    vocab: usize,
     start: usize,
 ) -> Result<(usize, Vec<CudaLayer>), LoadError> {
-    let n = model.layers.len();
-    let most = placement.gpu_layers.unwrap_or(n).min(n);
+    let model = fit.model;
+    let n = layers.len();
+    let most = most.min(n);
     let free = || gpu.ctx.memory_info().map(|(f, _)| f).map_err(cuda_error);
-    let cap = placement.device_bytes.unwrap_or(usize::MAX);
-    let mut layers = Vec::new();
+    let cap = fit.cap;
+    let mut uploaded = Vec::new();
     let mut largest = 0;
-    for l in model.layers.iter().rev().take(most) {
+    for l in layers.iter().rev().take(most) {
         let before = free()?;
         if before < DEVICE_RESERVE + largest || start.saturating_sub(before) + largest > cap {
             break;
         }
         match CudaLayer::upload(gpu, l, None, model.eps) {
-            Ok(layer) => layers.push(layer),
+            Ok(layer) => uploaded.push(layer),
             // A failure past the first layer is the device running out.
-            Err(_) if !layers.is_empty() => break,
+            Err(_) if !uploaded.is_empty() => break,
             Err(e) => return Err(e),
         }
         largest = largest.max(before.saturating_sub(free()?));
     }
-    layers.reverse();
+    uploaded.reverse();
     // Give up layers from the front until one state fits beside them.
-    while !layers.is_empty() {
-        let refs: Vec<&CudaLayer> = layers.iter().collect();
+    while !uploaded.is_empty() {
+        let refs: Vec<&CudaLayer> = uploaded.iter().collect();
         let fits = match Work::new(
             gpu,
             &refs,
             model.n_embd,
-            context,
-            rows,
+            fit.context,
+            fit.rows,
             vocab,
             0,
             model.folded,
@@ -87,12 +163,9 @@ pub(super) fn upload_layers(
         if fits {
             break;
         }
-        layers.remove(0);
+        uploaded.remove(0);
     }
-    if layers.is_empty() && n > 0 {
-        return Err(LoadError("no layer fits on the device".into()));
-    }
-    Ok((n - layers.len(), layers))
+    Ok((n - uploaded.len(), uploaded))
 }
 
 impl CudaModel<'_> {

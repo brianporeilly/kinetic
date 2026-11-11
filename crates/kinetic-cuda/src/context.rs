@@ -5,6 +5,10 @@ use crate::device::Device;
 use crate::driver::{self, Api, CuContext};
 use crate::error::Result;
 
+/// `CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED`: another context of this
+/// process asked first, which is as good.
+const PEER_ACCESS_ALREADY_ENABLED: i32 = 704;
+
 /// A device's primary context.
 ///
 /// Every resource holds an `Rc` to the context it was made in, so the
@@ -32,6 +36,31 @@ impl Context {
 
     pub fn device(&self) -> Device {
         self.device
+    }
+
+    /// Lets this context read and write `peer`'s memory directly, over
+    /// NVLink or PCIe, where the two devices can; returns whether they can.
+    /// Copies between contexts work either way, those between devices
+    /// without access going through host memory, which the driver handles.
+    pub fn enable_peer_access(&self, peer: &Context) -> Result<bool> {
+        if self.device == peer.device {
+            return Ok(true);
+        }
+        let api = self.enter()?;
+        let mut can = 0;
+        // SAFETY: `can` is a valid out-pointer; both devices are valid.
+        api.check("cuDeviceCanAccessPeer", unsafe {
+            (api.device_can_access_peer)(&mut can, self.device.raw, peer.device.raw)
+        })?;
+        if can == 0 {
+            return Ok(false);
+        }
+        // SAFETY: `peer.raw` is a retained context; flags must be 0.
+        let status = unsafe { (api.ctx_enable_peer_access)(peer.raw, 0) };
+        match status {
+            PEER_ACCESS_ALREADY_ENABLED => Ok(true),
+            _ => api.check("cuCtxEnablePeerAccess", status).map(|()| true),
+        }
     }
 
     /// Makes this context current on the calling thread.

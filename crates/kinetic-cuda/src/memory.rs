@@ -263,7 +263,8 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     }
 
     /// Queues a copy of elements `range` of `src` into this buffer from
-    /// element `start` on `stream`.
+    /// element `start` on `stream`. `src` may live in another context, on
+    /// another device: the copy then goes between them as a peer copy.
     pub fn copy_from_device(
         &mut self,
         start: usize,
@@ -276,6 +277,23 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         if range.is_empty() {
             return Ok(());
         }
+        let bytes = range.len() * size_of::<T>();
+        if !Rc::ptr_eq(&self.ctx, &src.ctx) {
+            // Unified addressing tells the driver which device each address
+            // is on; unlike cuMemcpyPeerAsync this copy can be captured into
+            // a graph.
+            let api = stream.context().enter()?;
+            // SAFETY: both ranges lie inside their buffers, and the driver
+            // waits for queued work before freeing either.
+            return api.check("cuMemcpyAsync", unsafe {
+                (api.memcpy_async)(
+                    self.ptr_at(start),
+                    src.ptr_at(range.start),
+                    bytes,
+                    stream.raw(),
+                )
+            });
+        }
         let api = self.ctx.enter()?;
         // SAFETY: both ranges lie inside their buffers, and the driver
         // waits for queued work before freeing either.
@@ -283,7 +301,7 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             (api.memcpy_dtod_async)(
                 self.ptr_at(start),
                 src.ptr_at(range.start),
-                range.len() * size_of::<T>(),
+                bytes,
                 stream.raw(),
             )
         })

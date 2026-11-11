@@ -770,7 +770,7 @@ More: [FAQ and troubleshooting](https://veloresearch.github.io/kinetic/faq.html)
 | Area | Coming next |
 |---|---|
 | RAD-1 | block drafters: many tokens guessed per pass |
-| GPU | faster short prompts, two GPUs |
+| GPU | faster short prompts, more models on several GPUs |
 | Models | Gemma 4 26B A4B, LFM2.5 MoE, Qwen3 MoE |
 | Formats | PrismML's 1-bit types at full speed |
 | Vulkan | MoE, layer split, faster prompts |

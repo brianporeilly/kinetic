@@ -142,6 +142,11 @@ enum Command {
         /// Where the model runs; auto picks the GPU when the model fits on it
         #[arg(long, value_enum, default_value_t = Device::Auto, ignore_case = true)]
         device: Device,
+        /// CUDA GPUs to spread the model's layers over, in CUDA's order as
+        /// `kinetic doctor` lists them, such as 0,1; the first also holds the
+        /// embeddings and the output head [default: 0]
+        #[arg(long, value_name = "LIST", value_delimiter = ',')]
+        gpus: Vec<usize>,
         /// Also run llama.cpp's llama-bench on the same file with the same
         /// settings and print a card comparing both [default: llama-bench
         /// on PATH or in a usual install folder]
@@ -305,6 +310,11 @@ struct RuntimeArgs {
     /// Most layers on the GPU; the rest run on the CPU [default: as many as fit]
     #[arg(long, value_name = "N")]
     gpu_layers: Option<usize>,
+    /// CUDA GPUs to spread the model's layers over, in CUDA's order as
+    /// `kinetic doctor` lists them, such as 0,1; the first also holds the
+    /// embeddings and the output head [default: 0]
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    gpus: Vec<usize>,
     /// Directory for states of earlier prompts, which later prompts that
     /// start the same way resume from [default: the user's cache directory]
     #[arg(long, value_name = "DIR")]
@@ -667,6 +677,7 @@ fn run(cli: Cli) -> Result<()> {
             repetitions,
             threads,
             device,
+            gpus,
             compare,
             depth,
             off,
@@ -688,7 +699,15 @@ fn run(cli: Cli) -> Result<()> {
                 repetitions: repetitions.max(1),
                 depth,
             };
-            bench::run(&model.path, &model.name, device, tests, &off.off, json)
+            bench::run(
+                &model.path,
+                &model.name,
+                device,
+                &gpus,
+                tests,
+                &off.off,
+                json,
+            )
         }
         Command::Doctor => doctor::run(),
         Command::Fit { target } => fit::run(target.as_deref()),
@@ -879,8 +898,9 @@ fn with_engine(
 fn gpu_context(model: &Model, header: &Gguf, runtime: &RuntimeArgs, wanted: usize) -> usize {
     let gpu = cfg!(feature = "cuda") && matches!(runtime.device, Device::Auto | Device::Cuda);
     let weights = fit::Weights::of(header);
-    // experts leave the GPU by design, and --gpu-layers asked for a split
-    if !gpu || runtime.gpu_layers.is_some() || weights.has_experts() {
+    // experts leave the GPU by design, --gpu-layers asked for a split and
+    // --gpus for several GPUs, which this does not add up
+    if !gpu || runtime.gpu_layers.is_some() || runtime.gpus.len() > 1 || weights.has_experts() {
         return wanted;
     }
     let Some(free) = system::cuda_free() else {
@@ -974,6 +994,7 @@ fn cuda_backend<'a>(
 ) -> Option<std::result::Result<Placed<'a>, kinetic_models::LoadError>> {
     let placement = kinetic_models::cuda::Placement {
         gpu_layers: runtime.gpu_layers,
+        devices: runtime.gpus.clone(),
         eager: runtime.is_off(Tech::Torque),
         cache_k: runtime.cache_type_k.into(),
         cache_v: runtime.cache_type_v.into(),

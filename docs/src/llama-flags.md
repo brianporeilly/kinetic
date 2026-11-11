@@ -29,7 +29,7 @@ argument":
 
 ```text
 $ kinetic run model.gguf -ts 1,1 "Hello"
-kinetic: -ts is a llama.cpp flag: Kinetic runs the model wholly on one device; choose it with --device.
+kinetic: -ts is a llama.cpp flag: Kinetic splits a model by layers only; choose the device with --device, and spread the layers over several CUDA GPUs with --gpus 0,1.
 ```
 
 <!-- The table is generated from crates/kinetic-cli/src/llama_flags.rs by
