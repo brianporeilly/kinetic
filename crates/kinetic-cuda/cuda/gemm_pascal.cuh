@@ -17,7 +17,9 @@
 // k order, one f32 fused multiply-add each; the tile a batch lands in does
 // not change an output's bits. Narrow tiles (4 by 4) suit small matrices,
 // wide ones (8 by 8, or 8 by 4 in f32, whose expanded sub-blocks would not
-// fit the shared memory) read half as much shared memory per product.
+// fit the shared memory) read half as much shared memory per product; the
+// host takes the narrow ones for f16 pairs, where the wide ones measured
+// slower on the P100.
 //
 // The inputs are the GEMV input's int8 copy times its block scales, the
 // values the GEMV and the tensor-core kernels multiply; the sums may differ
