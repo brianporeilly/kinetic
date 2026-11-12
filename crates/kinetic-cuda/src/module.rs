@@ -79,6 +79,8 @@ impl LaunchConfig {
 
 /// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES from cuda.h.
 const MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
+/// CU_FUNC_ATTRIBUTE_BINARY_VERSION from cuda.h.
+const BINARY_VERSION: c_int = 6;
 
 /// A kernel in a loaded [`Module`].
 pub struct Function {
@@ -95,6 +97,18 @@ impl Function {
         api.check("cuFuncSetAttribute", unsafe {
             (api.func_set_attribute)(self.raw, MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as c_int)
         })
+    }
+
+    /// The compute capability the loaded binary was built for, as
+    /// 10 major + minor: what runs, which may be older than the device.
+    pub fn binary_version(&self) -> Result<u32> {
+        let api = self.module.ctx.enter()?;
+        let mut v: c_int = 0;
+        // SAFETY: the function is live and `v` a valid out-pointer.
+        api.check("cuFuncGetAttribute", unsafe {
+            (api.func_get_attribute)(&mut v, BINARY_VERSION, self.raw)
+        })?;
+        Ok(v as u32)
     }
 
     /// Queues the kernel on `stream`.

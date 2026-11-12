@@ -142,6 +142,9 @@ fn check_large_batch(ty: TensorType, rows: usize, cols: usize, n: usize) {
     let y = y.to_vec().unwrap();
 
     let xe = effective_input(ty, &x, &input);
+    // f16 pairs round each weight and short sums
+    let half = gpu.kernels.half_products() && !matches!(ty, TensorType::F16 | TensorType::F32);
+    let tolerance = if half { 2e-3 } else { 1e-5 };
     let mut row = vec![0.0; cols];
     for r in 0..rows {
         dequantize(ty, m.row(r), &mut row).unwrap();
@@ -155,7 +158,7 @@ fn check_large_batch(ty: TensorType, rows: usize, cols: usize, n: usize) {
                 .sum();
             let got = y[i * rows + r] as f64;
             assert!(
-                (got - exact).abs() <= 1e-5 * magnitude + 1e-6,
+                (got - exact).abs() <= tolerance * magnitude + 1e-6,
                 "{ty} row {r} input {i}: got {got}, expected {exact}"
             );
         }

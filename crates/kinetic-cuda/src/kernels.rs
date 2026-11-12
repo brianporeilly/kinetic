@@ -193,6 +193,20 @@ impl Kernels {
         self.attn_flash.is_some() || !self.tensor_cores
     }
 
+    /// Whether the products of large batches multiply in f16 pairs: on
+    /// devices without tensor cores, where the binary that runs is for sm_60
+    /// or sm_70, whose f16 arithmetic is twice as fast as f32. They are then
+    /// accurate to about one part in a thousand of their terms rather than
+    /// to f32 rounding.
+    pub fn half_products(&self) -> bool {
+        if self.tensor_cores {
+            return false;
+        }
+        let any = self.gemm.iter().find_map(|fs| fs.first());
+        any.and_then(|f| f.binary_version().ok())
+            .is_some_and(|v| v == 60 || v == 70)
+    }
+
     /// Reads all of `data` once and adds its sum as 32-bit words to `out[0]`.
     ///
     /// The sum is meaningless; the kernel's throughput is the achievable
