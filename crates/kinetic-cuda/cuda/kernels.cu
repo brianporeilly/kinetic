@@ -10,6 +10,7 @@
 #include "embed.cuh"
 #include "gemm.cuh"
 #include "gemm_float.cuh"
+#include "gemm_pascal.cuh"
 #include "ffn.cuh"
 #include "gemv_float.cuh"
 #include "gemv_iq.cuh"

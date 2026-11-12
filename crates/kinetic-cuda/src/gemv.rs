@@ -178,6 +178,16 @@ pub(crate) struct Act {
 impl Act {
     /// For kernels that write no GEMV input.
     pub(crate) const NULL: Act = Act { x: 0, qs: 0, ds: 0 };
+
+    /// The inputs from input `first` on, of `width` elements each.
+    pub(crate) fn skip_inputs(self, first: usize, width: usize) -> Act {
+        let at = (first * width) as u64;
+        Act {
+            x: self.x + 4 * at,
+            qs: self.qs + at,
+            ds: self.ds + 8 * at / Q8_BLOCK as u64,
+        }
+    }
 }
 
 /// Up to `capacity` GEMV input vectors of `width` elements, kept both as f32
