@@ -43,8 +43,9 @@ const HALF_TILES: [Tile; 1] = [Tile {
 }];
 /// Quantized weights without tensor cores, narrow and wide: the kernels
 /// `p<format kernel>` and `p<format kernel>_wide` of gemm_pascal.cuh, whose
-/// shared memory is static. The wide tile takes 128 inputs where the
-/// products run in f16 pairs and 64 in f32; must match pgemm's tiles.
+/// shared memory is static. The wide tile is 64 rows by 128 inputs where
+/// the products run in f16 pairs, two blocks a multiprocessor, and 128 by
+/// 64 in f32, one; must match pgemm's tiles.
 const PASCAL_TILES: [Tile; 2] = [
     Tile {
         rows: 64,
@@ -62,7 +63,7 @@ const PASCAL_TILES: [Tile; 2] = [
 const PASCAL_HALF_TILES: [Tile; 2] = [
     PASCAL_TILES[0],
     Tile {
-        rows: 128,
+        rows: 64,
         inputs: 128,
         threads: 256,
         shared: 0,
@@ -288,8 +289,7 @@ impl Kernels {
 
     /// The kernel for `n` inputs of `w` and its tile: the narrowest that
     /// takes them all, or the widest; without tensor cores, the wide tile
-    /// where its blocks fill every multiprocessor, one each, unless the
-    /// products run in f16 pairs.
+    /// where its blocks fill every multiprocessor, as many as fit each.
     fn gemm_kernel(&self, w: &DeviceMatrix, n: usize) -> Option<(&Function, &'static Tile)> {
         // Formats without a tiled kernel run their prompts through the GEMV.
         let i = weight_index(w.ty())?;
@@ -305,10 +305,8 @@ impl Kernels {
         } else {
             let wide = &tiles[1];
             let blocks = (n as u32).div_ceil(wide.inputs) * (w.rows() as u32).div_ceil(wide.rows);
-            // perf: on a Tesla P100 the wide f16 tile ran at 6.4-8.3 TFLOPS
-            // against the narrow one's 8.5-8.9; its stage leaves room for one
-            // block per multiprocessor, too few warps to hide the latency
-            usize::from(!self.half && blocks >= self.multiprocessors)
+            let per_sm = if self.half { 2 } else { 1 };
+            usize::from(blocks >= per_sm * self.multiprocessors)
         };
         Some((self.gemm.get(i)?.get(k)?, &tiles[k]))
     }

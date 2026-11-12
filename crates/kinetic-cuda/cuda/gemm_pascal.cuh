@@ -16,10 +16,9 @@
 // TR rows by TC inputs, in groups of four 64 apart, and adds their terms in
 // k order, one f32 fused multiply-add each; the tile a batch lands in does
 // not change an output's bits. Narrow tiles (4 by 4) suit small matrices,
-// wide ones (8 by 8, or 8 by 4 in f32, whose expanded sub-blocks would not
-// fit the shared memory) read half as much shared memory per product; the
-// host takes the narrow ones for f16 pairs, where the wide ones measured
-// slower on the P100.
+// wide ones read less shared memory per product: 8 by 4 in f32, and 4 by 8
+// in f16 pairs, whose 64-row stage leaves room for two blocks on a P100's
+// multiprocessor (128 rows left room for one, too few warps).
 //
 // The inputs are the GEMV input's int8 copy times its block scales, the
 // values the GEMV and the tensor-core kernels multiply; the sums may differ
@@ -283,13 +282,16 @@ __device__ __forceinline__ void pgemm(const uint8_t* w, Q8Input x, float* y, uns
         }
 }
 
-// Wide tiles: 8 by 8 in f16 pairs, 8 by 4 in f32.
+// Wide tiles: 4 by 8 in f16 pairs, two blocks a multiprocessor; 8 by 4 in
+// f32, one.
+constexpr unsigned PGEMM_WIDE_TR = PGEMM_HALF ? 4 : 8;
 constexpr unsigned PGEMM_WIDE_TC = PGEMM_HALF ? 8 : 4;
+constexpr unsigned PGEMM_WIDE_BLOCKS = PGEMM_HALF ? 2 : 1;
 
 // The signature of gemm.cuh's kernels, so that gemm.rs launches both alike;
 // `up`, `yq`, `yds` and `gelu_gate` are unused (gated products are not
-// fused here). `name` takes 64 by 64 tiles, `name_wide` 128 by 128 (128
-// by 64 in f32); must match PASCAL_TILES in gemm.rs.
+// fused here). `name` takes 64 by 64 tiles, `name_wide` 64 by 128 in f16
+// pairs and 128 by 64 in f32; must match PASCAL_TILES in gemm.rs.
 #define PGEMM_KERNEL(name, F)                                                                   \
     extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 2)                              \
         name(const uint8_t* w, const uint8_t*, const int8_t* xq, const float2* xds, float* y,   \
@@ -297,11 +299,11 @@ constexpr unsigned PGEMM_WIDE_TC = PGEMM_HALF ? 8 : 4;
              unsigned) {                                                                        \
         pgemm<F, 4, 4>(w, Q8Input{xq, xds}, y, rows, cols, total, n);                           \
     }                                                                                           \
-    extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 1)                              \
+    extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, PGEMM_WIDE_BLOCKS)              \
         name##_wide(const uint8_t* w, const uint8_t*, const int8_t* xq, const float2* xds,      \
                     float* y, int8_t*, float2*, unsigned rows, unsigned cols, size_t total,     \
                     unsigned n, unsigned) {                                                     \
-        pgemm<F, 8, PGEMM_WIDE_TC>(w, Q8Input{xq, xds}, y, rows, cols, total, n);               \
+        pgemm<F, PGEMM_WIDE_TR, PGEMM_WIDE_TC>(w, Q8Input{xq, xds}, y, rows, cols, total, n);   \
     }
 
 PGEMM_KERNEL(pgemm_q4_k, GemmK4<false>)
