@@ -29,6 +29,7 @@ fn batches_and_rollbacks_change_no_bit() {
     rollback_leaves_the_state_as_if_never_run(&gpu);
     a_host_copy_restores_the_state(&gpu, &model);
     shared_passes_match_running_alone(&gpu);
+    let predicted = predictions(&gpu);
     let full = gpu.weight_bytes();
     drop(gpu);
 
@@ -46,6 +47,7 @@ fn batches_and_rollbacks_change_no_bit() {
         let spread = CudaModel::load_with(&model, 64, placement).unwrap();
         assert_eq!(spread.device_split().len(), 2, "{devices:?}");
         assert_eq!(logits(&spread), whole, "{devices:?}");
+        assert_eq!(predictions(&spread), predicted, "{devices:?}");
         a_batch_matches_token_by_token(&spread);
         rollback_leaves_the_state_as_if_never_run(&spread);
         a_host_copy_restores_the_state(&spread, &model);
@@ -101,6 +103,19 @@ fn long_prompt(gpu: &CudaModel) -> (Vec<u32>, Vec<u32>) {
     let mut state = gpu.new_state().unwrap();
     let out = gpu.run(&mut state, &tokens, false).unwrap();
     (bits(&out.hidden), bits(&out.logits))
+}
+
+/// The prediction block's output over the prompt, each position's hidden
+/// state with the token after it, as bits; `None` without a block.
+fn predictions(gpu: &CudaModel) -> Option<Vec<u32>> {
+    let mut mtp = gpu.new_mtp_state().unwrap()?;
+    let mut state = gpu.new_state().unwrap();
+    let hidden = gpu.run(&mut state, &PROMPT, false).unwrap().hidden;
+    let d = hidden.len() / PROMPT.len();
+    let rows = &hidden[..(PROMPT.len() - 1) * d];
+    Some(bits(
+        &gpu.mtp_forward(&mut mtp, rows, &PROMPT[1..]).unwrap(),
+    ))
 }
 
 /// The logits after a prompt and then each of a few single tokens, as bits.
