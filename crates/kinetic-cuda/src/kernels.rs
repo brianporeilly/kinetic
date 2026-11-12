@@ -51,6 +51,8 @@ pub struct Kernels {
     /// Attention for batches larger than [`MAX_BATCH`], where the device has
     /// the shared memory it needs.
     pub(crate) attn_flash: Option<Function>,
+    /// The same in f32 without tensor cores, for heads of 128 to 512.
+    pub(crate) attn_tile: Option<Function>,
     pub(crate) attn_combine: Function,
     pub(crate) attn_copy_kv: Function,
     pub(crate) delta_conv: Function,
@@ -109,8 +111,8 @@ impl Kernels {
             })
             .transpose()?;
         // The tiled products and flash attention run on tensor cores; without
-        // them the products of quantized weights run in f32 and attention
-        // MAX_BATCH tokens at a time.
+        // them both run in f32, and attention to heads of 64 MAX_BATCH tokens
+        // at a time.
         let tensor_cores = info.tensor_cores();
         let gemm = gemm_functions(&module, tensor_cores)?;
         let attn_flash = module.function(c"attn_flash")?;
@@ -119,6 +121,9 @@ impl Kernels {
                 .allow_shared(FLASH_HEADS.into_iter().map(flash_shared).max().unwrap_or(0))
                 .is_ok())
         .then_some(attn_flash);
+        let attn_tile = (!tensor_cores)
+            .then(|| module.function(c"attn_tile"))
+            .transpose()?;
         let moe = |prefix: &str| -> Result<[Function; EXPERT_TYPES.len()]> {
             let named = |ty: &str| {
                 module.function(
@@ -156,6 +161,7 @@ impl Kernels {
                 module.function(c"attn_chunk_2")?,
             ],
             attn_flash,
+            attn_tile,
             attn_combine: module.function(c"attn_combine")?,
             attn_copy_kv: module.function(c"attn_copy_kv")?,
             delta_conv: module.function(c"delta_conv")?,
@@ -187,8 +193,9 @@ impl Kernels {
 
     /// Whether batches of more than [`MAX_BATCH`] tokens can run in one pass;
     /// without, they must go in steps of at most that many. Devices without
-    /// tensor cores run them with f32 products, attention in steps of
-    /// [`MAX_BATCH`] tokens and the delta rule token by token.
+    /// tensor cores run them with f32 products and attention, attention to
+    /// heads of 64 in steps of [`MAX_BATCH`] tokens and the delta rule token
+    /// by token.
     pub fn large_batches(&self) -> bool {
         self.attn_flash.is_some() || !self.tensor_cores
     }

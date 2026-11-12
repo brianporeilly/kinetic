@@ -4,6 +4,7 @@
 #include "argmax.cuh"
 #include "attention.cuh"
 #include "attention_flash.cuh"
+#include "attention_tile.cuh"
 #include "delta_chunk.cuh"
 #include "delta_net.cuh"
 #include "delta_scan.cuh"

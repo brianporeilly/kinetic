@@ -32,6 +32,11 @@ const FLASH_PAD: usize = 8;
 
 /// Head sizes the flash kernel handles.
 pub(crate) const FLASH_HEADS: [usize; 4] = [64, 128, 256, 512];
+/// Queries and threads per block of the f32 tile kernel, and the head sizes
+/// it handles; must match attention_tile.cuh.
+const TILE_QUERIES: u32 = 64;
+const TILE_THREADS: u32 = 256;
+const TILE_HEADS: [usize; 3] = [128, 256, 512];
 
 /// Value dims of one flash block: heads of 512 split their outputs over two.
 fn flash_values(hd: usize) -> usize {
@@ -432,12 +437,13 @@ impl Kernels {
     /// each query over its causal (and windowed) past and writes the gated
     /// result to `io.out`.
     ///
-    /// Batches of more than [`MAX_BATCH`] tokens run flash-style on tensor
-    /// cores without scratch, as accurate as f32 arithmetic but summed in
-    /// another order, so their results differ slightly from smaller batches.
-    /// Without tensor cores they store every key and value first, then attend
-    /// [`MAX_BATCH`] queries at a time, with the scratch and results of
-    /// smaller batches. They need [`Kernels::large_batches`]. A windowed
+    /// Batches of more than [`MAX_BATCH`] tokens run flash-style without
+    /// scratch, on tensor cores as accurate as f32 arithmetic and without
+    /// them in f32, but summed in another order, so their results differ
+    /// slightly from smaller batches. Without tensor cores, heads of 64
+    /// store every key and value first, then attend [`MAX_BATCH`] queries at
+    /// a time, with the scratch and results of smaller batches. They need
+    /// [`Kernels::large_batches`]. A windowed
     /// cache must hold the window and the batch.
     pub fn attention(
         &self,
@@ -503,8 +509,11 @@ impl Kernels {
             }
         }
         let flash = n > MAX_BATCH && self.attn_flash.is_some();
+        let tile = (n > MAX_BATCH && TILE_HEADS.contains(&hd))
+            .then_some(self.attn_tile.as_ref())
+            .flatten();
         let stored_heads = if params.store { s.n_head_kv as u32 } else { 0 };
-        if !flash {
+        if !flash && tile.is_none() {
             io.scratch.check_holds(
                 s.scratch_len(n.min(MAX_BATCH), cache.slots),
                 "attention scratch",
@@ -593,6 +602,16 @@ impl Kernels {
                     Error::Shape(format!("{n} tokens in one pass need the flash kernel"))
                 })?;
                 flash.launch(config, stream, &mut [arg(&args), arg(&n)])?;
+                return io.out.quantize(self, n as usize, stream);
+            }
+            if let Some(tile) = tile {
+                let values = if hd == 512 { 256 } else { hd };
+                let config = LaunchConfig {
+                    grid: [n.div_ceil(TILE_QUERIES), heads, (hd / values) as u32],
+                    block: [TILE_THREADS, 1, 1],
+                    shared_bytes: 0,
+                };
+                tile.launch(config, stream, &mut [arg(&args), arg(&n)])?;
                 return io.out.quantize(self, n as usize, stream);
             }
             // perf: two query heads of a KV group per block measured best,

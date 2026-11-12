@@ -61,10 +61,10 @@ supported, with kernels for compute capability 6.0, 6.1, 7.0, 7.5, 8.0, 8.6,
 
 Pascal and Volta (compute capability 6.x and 7.0) have none of the tensor
 cores the prompt kernels use. Prompts run there in batches of up to 512
-tokens through f32 matrix products of the quantized weights, with attention
-and the delta rule taken 16 tokens at a time, so long prompts take longer
-than on Turing and newer; generation runs the same kernels as on newer
-GPUs. On the Tesla P100 and V100 (6.0 and 7.0), whose f16 arithmetic runs at
+tokens through f32 matrix products of the quantized weights and f32
+attention in tiles of 64 queries, with the delta rule (and attention to
+heads of 64) taken 16 tokens at a time, so prompts take longer than on
+Turing and newer; generation runs the same kernels as on newer GPUs. On the Tesla P100 and V100 (6.0 and 7.0), whose f16 arithmetic runs at
 twice the f32 rate, the products multiply weights and inputs in pairs of f16
 values and apply the scales in f32, about 1.5 times as fast; their results
 differ from the f32 products in the last bits, as a different order of
