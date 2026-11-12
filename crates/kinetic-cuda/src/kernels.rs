@@ -81,6 +81,8 @@ pub struct Kernels {
     pub(crate) multiprocessors: u32,
     /// See [`DeviceInfo::tensor_cores`](crate::DeviceInfo::tensor_cores).
     pub(crate) tensor_cores: bool,
+    /// See [`Kernels::half_products`].
+    pub(crate) half: bool,
 }
 
 impl Kernels {
@@ -115,6 +117,13 @@ impl Kernels {
         // at a time.
         let tensor_cores = info.tensor_cores();
         let gemm = gemm_functions(&module, tensor_cores)?;
+        // The binary that runs is for sm_60 or sm_70.
+        let half = !tensor_cores
+            && gemm
+                .iter()
+                .find_map(|fs| fs.first())
+                .and_then(|f| f.binary_version().ok())
+                .is_some_and(|v| v == 60 || v == 70);
         let attn_flash = module.function(c"attn_flash")?;
         let attn_flash = (tensor_cores
             && attn_flash
@@ -188,6 +197,7 @@ impl Kernels {
             read_sum: module.function(c"read_sum")?,
             multiprocessors: info.multiprocessors,
             tensor_cores,
+            half,
         })
     }
 
@@ -206,12 +216,7 @@ impl Kernels {
     /// accurate to about one part in a thousand of their terms rather than
     /// to f32 rounding.
     pub fn half_products(&self) -> bool {
-        if self.tensor_cores {
-            return false;
-        }
-        let any = self.gemm.iter().find_map(|fs| fs.first());
-        any.and_then(|f| f.binary_version().ok())
-            .is_some_and(|v| v == 60 || v == 70)
+        self.half
     }
 
     /// Reads all of `data` once and adds its sum as 32-bit words to `out[0]`.
