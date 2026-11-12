@@ -51,6 +51,23 @@ fn batches_and_rollbacks_change_no_bit() {
         a_host_copy_restores_the_state(&spread, &model);
     }
 
+    // A prompt of several full passes, whose hidden rows come back from the
+    // last device while the first goes on with the next pass.
+    let single = CudaModel::load(&model, LONG + 8).unwrap();
+    let whole_long = long_prompt(&single);
+    drop(single);
+    for devices in [vec![0, 0], vec![0, 1]]
+        .into_iter()
+        .filter(|d| two || d[1] == 0)
+    {
+        let placement = Placement {
+            devices: devices.clone(),
+            ..Placement::default()
+        };
+        let spread = CudaModel::load_with(&model, LONG + 8, placement).unwrap();
+        assert!(long_prompt(&spread) == whole_long, "{devices:?}");
+    }
+
     // Half the layers on the host, as when the device is too small.
     let layers = model.n_layers();
     let placement = Placement {
@@ -73,6 +90,17 @@ fn batches_and_rollbacks_change_no_bit() {
     assert!(capped.host_layers() > 0 && capped.host_layers() < layers);
     assert!(capped.weight_bytes() <= full / 2);
     a_batch_matches_token_by_token(&capped);
+}
+
+/// Tokens of the long prompt: more than two full prefill batches.
+const LONG: usize = 1100;
+
+/// The hidden rows and last logits of a long prompt, as bits.
+fn long_prompt(gpu: &CudaModel) -> (Vec<u32>, Vec<u32>) {
+    let tokens: Vec<u32> = (0..LONG).map(|i| (i * 7919 % 4000 + 10) as u32).collect();
+    let mut state = gpu.new_state().unwrap();
+    let out = gpu.run(&mut state, &tokens, false).unwrap();
+    (bits(&out.hidden), bits(&out.logits))
 }
 
 /// The logits after a prompt and then each of a few single tokens, as bits.

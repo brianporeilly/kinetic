@@ -33,6 +33,7 @@ mod per_layer;
 mod scratch;
 mod short_conv;
 mod split;
+mod staging;
 mod target;
 
 use std::cell::{Cell, RefCell};
@@ -56,6 +57,7 @@ use layer::{copy_lent, CudaLayer, LayerState, Routed};
 use pass::{PassRows, PASS_ROWS};
 use per_layer::{CudaLayerInput, CudaPerLayer};
 use scratch::{Scratch, Spare, Work};
+use staging::Staging;
 
 pub use experts::{Plan, PoolPlan, Stats};
 pub use host::CudaRunner;
@@ -89,6 +91,9 @@ struct Gpu {
     /// Recorded where this device hands its work over to another, which
     /// waits for it.
     handoff: Event,
+    /// Recorded once this device has copied what another handed it over,
+    /// which that device waits for before it overwrites the source.
+    copied: Event,
     /// How attention caches store keys and values.
     cache: [KvType; 2],
 }
@@ -116,6 +121,7 @@ impl Gpu {
             fork: Event::new(&ctx)?,
             join: Event::new(&ctx)?,
             handoff: Event::new(&ctx)?,
+            copied: Event::new(&ctx)?,
             cache: [KvType::F16; 2],
             ctx,
         })
@@ -194,6 +200,9 @@ pub struct CudaModel<'m> {
     /// Set when a decode step over several devices could not be recorded;
     /// steps then run kernel by kernel.
     unrecorded: Cell<bool>,
+    /// Where the hidden rows of prompt passes over several devices go on
+    /// their way to the host; made by the first such pass.
+    staging: RefCell<Option<Staging>>,
 }
 
 /// The token embedding table: on the device, or, in a model whose device
@@ -415,6 +424,7 @@ impl<'m> CudaModel<'m> {
             shared_step: RefCell::new(None),
             eager: placement.eager,
             unrecorded: Cell::new(false),
+            staging: RefCell::new(None),
         };
         if let Some(moes) = moes {
             cuda.offload = Some(RefCell::new(cuda.plan_offload(moes)?));
@@ -758,6 +768,10 @@ impl<'m> CudaModel<'m> {
             self.forward_passes(state, tokens, logits, &mut out)?;
             return Ok(out);
         }
+        let mut staging = self.staging.borrow_mut();
+        if let Some(s) = staging.as_mut() {
+            s.reset()?;
+        }
         let mut done = 0;
         for chunk in batches(tokens, state.pos, since.is_none(), self.batch_rows()) {
             let n = chunk.len();
@@ -817,8 +831,37 @@ impl<'m> CudaModel<'m> {
                         .copy_range_to(0, &mut out.logits[start..])?;
                     self.host.cap(&mut out.logits[start..]);
                 }
+            } else if head.is_none() && !self.shards.is_empty() {
+                // The rows go to the host from the last shard, and the main
+                // device moves on to the next pass.
+                self.embed(&mut state.work, chunk)?;
+                self.queue_main(&mut state.work, flow)?;
+                for k in 0..self.shards.len() {
+                    self.hand_to_shard(&mut state.work, k)?;
+                    self.queue_shard(&mut state.work, k, flow)?;
+                }
+                let (last, w) = match (self.shards.last(), state.work.shards.last()) {
+                    (Some(s), Some(w)) => (s, w),
+                    _ => unreachable!("a work per shard"),
+                };
+                let len = self.batch_rows() * d;
+                if staging.as_ref().is_none_or(|s| s.len() < len) {
+                    *staging = Some(Staging::new(&last.gpu.ctx, len)?);
+                }
+                let s = staging.as_mut().expect("made above");
+                let range = done * d..(done + n) * d;
+                s.stage(
+                    w.scratch.h.values(),
+                    range,
+                    &mut out.hidden,
+                    &last.gpu.stream,
+                )?;
             } else {
                 self.queue(&mut state.work, chunk, flow)?;
+                // after queuing, so the devices are busy while the host waits
+                if let Some(s) = staging.as_mut() {
+                    s.drain(&mut out.hidden)?;
+                }
                 for rows in head.iter().flat_map(|r| slices(r.clone())) {
                     let m = rows.len();
                     self.queue_head(&mut state.work.scratch, rows)?;
@@ -829,6 +872,9 @@ impl<'m> CudaModel<'m> {
             }
             state.pos += n;
             done += n;
+        }
+        if let Some(s) = staging.as_mut() {
+            s.drain(&mut out.hidden)?;
         }
         Ok(out)
     }
@@ -1136,7 +1182,8 @@ impl<'m> CudaModel<'m> {
 }
 
 /// Queues on `to` copies of `batch` and of the stream and its norm in `src`
-/// into `dst`, once `from` has queued what writes them.
+/// into `dst`, once `from` has queued what writes them; what `from` queues
+/// later waits for the copies, not for the rest of `to`'s work.
 fn hand_over(
     from: &Gpu,
     to: &Gpu,
@@ -1152,7 +1199,9 @@ fn hand_over(
     dst.scratch
         .x
         .copy_from_device(0, &src.x, 0..n * d, &to.stream)?;
-    dst.scratch.h.copy_rows_from(0, &src.h, 0..n, &to.stream)
+    dst.scratch.h.copy_rows_from(0, &src.h, 0..n, &to.stream)?;
+    to.copied.record(&to.stream)?;
+    from.stream.wait(&to.copied)
 }
 
 /// Fails for what cannot yet run over several devices.
