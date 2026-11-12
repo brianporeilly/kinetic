@@ -41,14 +41,33 @@ const HALF_TILES: [Tile; 1] = [Tile {
     threads: 128,
     shared: 0,
 }];
-/// Quantized weights in f32 without tensor cores; must match PGEMM_* in
-/// gemm_pascal.cuh, whose shared memory is static.
-const PASCAL_TILES: [Tile; 1] = [Tile {
-    rows: 64,
-    inputs: 64,
-    threads: 256,
-    shared: 0,
-}];
+/// Quantized weights without tensor cores, narrow and wide: the kernels
+/// `p<format kernel>` and `p<format kernel>_wide` of gemm_pascal.cuh, whose
+/// shared memory is static. The wide tile takes 128 inputs where the
+/// products run in f16 pairs and 64 in f32; must match pgemm's tiles.
+const PASCAL_TILES: [Tile; 2] = [
+    Tile {
+        rows: 64,
+        inputs: 64,
+        threads: 256,
+        shared: 0,
+    },
+    Tile {
+        rows: 128,
+        inputs: 64,
+        threads: 256,
+        shared: 0,
+    },
+];
+const PASCAL_HALF_TILES: [Tile; 2] = [
+    PASCAL_TILES[0],
+    Tile {
+        rows: 128,
+        inputs: 128,
+        threads: 256,
+        shared: 0,
+    },
+];
 const FLOAT_TILES: [Tile; 1] = [Tile {
     rows: 32,
     inputs: 8,
@@ -61,6 +80,7 @@ const STAGE: usize = 128;
 const SPLIT_INPUTS: u32 = 512;
 
 /// Rows, inputs and threads per block, and dynamic shared bytes.
+#[derive(Clone, Copy)]
 struct Tile {
     rows: u32,
     inputs: u32,
@@ -87,9 +107,13 @@ fn is_float(ty: TensorType) -> bool {
     matches!(ty, TensorType::F32 | TensorType::F16)
 }
 
-fn tiles(ty: TensorType, tensor_cores: bool) -> &'static [Tile] {
+fn tiles(ty: TensorType, tensor_cores: bool, half: bool) -> &'static [Tile] {
     if !tensor_cores {
-        &PASCAL_TILES
+        if half {
+            &PASCAL_HALF_TILES
+        } else {
+            &PASCAL_TILES
+        }
     } else if ty == TensorType::F16 {
         &HALF_TILES
     } else if is_float(ty) {
@@ -103,8 +127,8 @@ fn tiles(ty: TensorType, tensor_cores: bool) -> &'static [Tile] {
 /// then by width, allowed the shared memory they take; none for a type
 /// without a tiled kernel or where the device has less shared memory
 /// (Turing), so those batches run as GEMVs. With `tensor_cores` they are
-/// gemm.cuh's and gemm_float.cuh's; without, gemm_pascal.cuh's f32 kernels
-/// of the quantized types.
+/// gemm.cuh's and gemm_float.cuh's; without, gemm_pascal.cuh's narrow and
+/// wide kernels of the quantized types.
 pub(crate) fn gemm_functions(
     module: &Rc<Module>,
     tensor_cores: bool,
@@ -119,11 +143,16 @@ pub(crate) fn gemm_functions(
                 if is_float(ty) {
                     return Ok(Vec::new());
                 }
-                let name = CString::new(format!("p{name}")).expect("kernel names have no NUL");
-                return Ok(vec![module.function(&name)?]);
+                let named = |n: String| {
+                    module.function(&CString::new(n).expect("kernel names have no NUL"))
+                };
+                return Ok(vec![
+                    named(format!("p{name}"))?,
+                    named(format!("p{name}_wide"))?,
+                ]);
             }
             let mut fs = Vec::new();
-            for tile in tiles(ty, true) {
+            for tile in tiles(ty, true, false) {
                 let name = if is_float(ty) {
                     name.to_owned()
                 } else {
@@ -258,18 +287,25 @@ impl Kernels {
     }
 
     /// The kernel for `n` inputs of `w` and its tile: the narrowest that
-    /// takes them all, or the widest.
+    /// takes them all, or the widest; without tensor cores, the wide tile
+    /// where its blocks fill every multiprocessor, one each.
     fn gemm_kernel(&self, w: &DeviceMatrix, n: usize) -> Option<(&Function, &'static Tile)> {
         // Formats without a tiled kernel run their prompts through the GEMV.
         let i = weight_index(w.ty())?;
         if !w.cols().is_multiple_of(STAGE) {
             return None;
         }
-        let tiles = tiles(w.ty(), self.tensor_cores);
-        let k = tiles
-            .iter()
-            .position(|t| n <= t.inputs as usize)
-            .unwrap_or(tiles.len() - 1);
+        let tiles = tiles(w.ty(), self.tensor_cores, self.half);
+        let k = if self.tensor_cores {
+            tiles
+                .iter()
+                .position(|t| n <= t.inputs as usize)
+                .unwrap_or(tiles.len() - 1)
+        } else {
+            let wide = &tiles[1];
+            let blocks = (n as u32).div_ceil(wide.inputs) * (w.rows() as u32).div_ceil(wide.rows);
+            usize::from(blocks >= self.multiprocessors)
+        };
         Some((self.gemm.get(i)?.get(k)?, &tiles[k]))
     }
 

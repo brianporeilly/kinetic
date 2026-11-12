@@ -225,9 +225,19 @@ __device__ __forceinline__ void attn_tile_impl(const AttnArgs& a, unsigned n, Ti
     }
 }
 
+// Blocks per multiprocessor the registers are fitted for: two where the
+// shared memory holds two, as it does on the GTX 10 series and the V100,
+// which pays for a few spilled registers; one on the P100, whose 64 KB hold
+// only one.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600
+constexpr unsigned TILE_BLOCKS = 1;
+#else
+constexpr unsigned TILE_BLOCKS = 2;
+#endif
+
 // grid (ceil(n / TILE_Q), n_head, head_dim / tile_values(head_dim)), block
 // TILE_THREADS; heads of 128, 256 or 512; `n` is the batch size.
-extern "C" __global__ void __launch_bounds__(TILE_THREADS, 2) attn_tile(AttnArgs a, unsigned n) {
+extern "C" __global__ void __launch_bounds__(TILE_THREADS, TILE_BLOCKS) attn_tile(AttnArgs a, unsigned n) {
     __shared__ __align__(16) TileShared sh;
     switch (a.head_dim) {
         case 128: attn_tile_impl<128>(a, n, sh); break;
