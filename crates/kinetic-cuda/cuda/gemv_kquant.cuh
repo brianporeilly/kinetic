@@ -96,15 +96,37 @@ struct KqQ6K {
     __device__ static float term(const Block& k, unsigned b, unsigned j, Q8Input x) {
         const int8_t* xp = x.qs + b * 256 + 32 * j;
         const float xd = __ldg(x.ds + b * 8 + j).x;
-        // Dotting the stored +32 with the input takes it back out.
-        const Words bias = {{0x20202020, 0x20202020, 0x20202020, 0x20202020}};
         float t[2];
 #pragma unroll
         for (unsigned r = 0; r < 2; ++r) {
             const Words a = load_cached(xp + 16 * r);
-            t[r] = kq_term(k.scale[r], 0.0f, xd, 0.0f, dot16(k.q[r], a) - dot16(bias, a));
+            t[r] = kq_term(k.scale[r], 0.0f, xd, 0.0f, unbiased_dot(k.q[r], a));
         }
         return __fadd_rn(t[0], t[1]);
+    }
+
+    // The integer dot product of quants stored + 32 with the input.
+    __device__ static int unbiased_dot(const Words& q, const Words& a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+        // Without dp4a a second dot product with the bias doubles the work.
+        // The stored values are below 64, so flipping bit 5 and shifting the
+        // word left by 2 makes each byte 4 (q - 32) as a signed byte, with
+        // nothing crossing into the next; the sum is then exactly 4 times
+        // the dot product.
+        int s = 0;
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {
+            const unsigned w = (static_cast<unsigned>(q.w[i]) ^ 0x20202020u) << 2;
+            const unsigned x = static_cast<unsigned>(a.w[i]);
+            s = mad_halves(byte_halves<EVEN_BYTES>(w), byte_halves<EVEN_BYTES>(x), s);
+            s = mad_halves(byte_halves<ODD_BYTES>(w), byte_halves<ODD_BYTES>(x), s);
+        }
+        return s >> 2;
+#else
+        // Dotting the stored +32 with the input takes it back out.
+        const Words bias = {{0x20202020, 0x20202020, 0x20202020, 0x20202020}};
+        return dot16(q, a) - dot16(bias, a);
+#endif
     }
 };
 

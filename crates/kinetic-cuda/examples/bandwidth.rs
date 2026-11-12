@@ -1,5 +1,8 @@
 //! Prints the first CUDA device, the achievable read bandwidth of its memory
-//! and the throughput of each GEMV kernel on decode-sized shapes.
+//! and the throughput of each GEMV kernel on decode-sized shapes, for one
+//! input and for batches of 4 and 8, as a speculative draft's verification
+//! runs them: weight bytes over time, so a batch that costs no more than one
+//! input keeps its rate.
 //!
 //! ```text
 //! cargo run --release -p kinetic-cuda --example bandwidth [-- model.gguf]
@@ -23,6 +26,8 @@ use kinetic_quant::{Matrix, TensorType};
 const READ_BYTES: usize = 512 << 20;
 const READ_REPS: usize = 20;
 const GEMV_REPS: usize = 100;
+/// Batch sizes timed besides one input.
+const BATCHES: [usize; 2] = [4, 8];
 
 /// (type, rows, cols): feed-forward up and down projections of a model with
 /// hidden size 2560, and its 248320-token output head.
@@ -77,8 +82,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let model = env::args_os().nth(1).map(GgufFile::open).transpose()?;
     println!(
-        "{:<6} {:>12} {:>7} {:>8} {:>9} {:>8} {:>8}",
-        "type", "rows x cols", "weights", "MB", "us", "GB/s", "of read"
+        "{:<6} {:>12} {:>7} {:>8} {:>9} {:>8} {:>8} {:>8} {:>8}",
+        "type", "rows x cols", "weights", "MB", "us", "GB/s", "of read", "GB/s x4", "GB/s x8"
     );
     for &(ty, rows, cols) in CASES {
         let from_model = model.as_ref().and_then(|f| find(f, ty, rows, cols));
@@ -91,17 +96,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
         let w = DeviceMatrix::upload(&ctx, &Matrix::new(ty, bytes, rows, cols))?;
-        let seconds = gemv_seconds(&ctx, &kernels, &stream, &w)?;
+        let seconds = gemv_seconds(&ctx, &kernels, &stream, &w, 1)?;
         let rate = w.size_bytes() as f64 / seconds;
+        let mut batched = Vec::new();
+        for n in BATCHES {
+            let s = gemv_seconds(&ctx, &kernels, &stream, &w, n)?;
+            batched.push(w.size_bytes() as f64 / s / 1e9);
+        }
         println!(
-            "{:<6} {:>12} {:>7} {:>8.1} {:>9.1} {:>8.1} {:>7.0}%",
+            "{:<6} {:>12} {:>7} {:>8.1} {:>9.1} {:>8.1} {:>7.0}% {:>8.1} {:>8.1}",
             ty.name(),
             format!("{rows}x{cols}"),
             source,
             w.size_bytes() as f64 / 1e6,
             seconds * 1e6,
             rate / 1e9,
-            100.0 * rate / read
+            100.0 * rate / read,
+            batched[0],
+            batched[1]
         );
     }
     Ok(())
@@ -149,13 +161,14 @@ fn gemv_seconds(
     kernels: &Kernels,
     stream: &Stream,
     w: &DeviceMatrix,
+    n: usize,
 ) -> Result<f64, Box<dyn Error>> {
-    let x: Vec<f32> = (0..w.cols()).map(|i| (i % 7) as f32 - 3.0).collect();
-    let mut input = GemvInput::new(ctx, w.cols())?;
-    let mut y = DeviceBuffer::new(ctx, w.rows())?;
+    let x: Vec<f32> = (0..n * w.cols()).map(|i| (i % 7) as f32 - 3.0).collect();
+    let mut input = GemvInput::batch(ctx, w.cols(), n)?;
+    let mut y = DeviceBuffer::new(ctx, n * w.rows())?;
     input.upload(kernels, &x, stream)?;
     time(ctx, stream, GEMV_REPS, || {
-        kernels.gemv(w, &input, &mut y, stream)
+        kernels.gemv_rows(w, w.rows(), &input, 0..n, &mut y, stream)
     })
 }
 
