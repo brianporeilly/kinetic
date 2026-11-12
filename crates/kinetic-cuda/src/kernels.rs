@@ -109,12 +109,10 @@ impl Kernels {
             })
             .transpose()?;
         // The tiled products and flash attention run on tensor cores; without
-        // them every product is a GEMV and batches go MAX_BATCH at a time.
+        // them the products of quantized weights run in f32 and attention
+        // MAX_BATCH tokens at a time.
         let tensor_cores = info.tensor_cores();
-        let gemm = match tensor_cores {
-            true => gemm_functions(&module)?,
-            false => WEIGHT_TYPES.iter().map(|_| Vec::new()).collect(),
-        };
+        let gemm = gemm_functions(&module, tensor_cores)?;
         let attn_flash = module.function(c"attn_flash")?;
         let attn_flash = (tensor_cores
             && attn_flash
@@ -188,9 +186,11 @@ impl Kernels {
     }
 
     /// Whether batches of more than [`MAX_BATCH`] tokens can run in one pass;
-    /// without, they must go in steps of at most that many.
+    /// without, they must go in steps of at most that many. Devices without
+    /// tensor cores run them with f32 products, attention in steps of
+    /// [`MAX_BATCH`] tokens and the delta rule token by token.
     pub fn large_batches(&self) -> bool {
-        self.attn_flash.is_some()
+        self.attn_flash.is_some() || !self.tensor_cores
     }
 
     /// Reads all of `data` once and adds its sum as 32-bit words to `out[0]`.

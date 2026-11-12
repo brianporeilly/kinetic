@@ -60,9 +60,11 @@ supported, with kernels for compute capability 6.0, 6.1, 7.0, 7.5, 8.0, 8.6,
 8.9, 9.0 and 12.0, and PTX that newer drivers compile for later GPUs.
 
 Pascal and Volta (compute capability 6.x and 7.0) have none of the tensor
-cores the prompt kernels use. Prompts run there 16 tokens at a time through
-the generation kernels, so long prompts take noticeably longer than on
-Turing and newer; generation runs the same kernels as on newer GPUs. The
+cores the prompt kernels use. Prompts run there in batches of up to 512
+tokens through f32 matrix products of the quantized weights, with attention
+and the delta rule taken 16 tokens at a time, so long prompts take longer
+than on Turing and newer; generation runs the same kernels as on newer
+GPUs. The
 Tesla P100 (6.0) also lacks the int8 dot product instruction, which its
 kernels do in plain integer arithmetic, with the same results and less
 speed.

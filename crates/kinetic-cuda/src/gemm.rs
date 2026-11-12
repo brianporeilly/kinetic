@@ -41,6 +41,14 @@ const HALF_TILES: [Tile; 1] = [Tile {
     threads: 128,
     shared: 0,
 }];
+/// Quantized weights in f32 without tensor cores; must match PGEMM_* in
+/// gemm_pascal.cuh, whose shared memory is static.
+const PASCAL_TILES: [Tile; 1] = [Tile {
+    rows: 64,
+    inputs: 64,
+    threads: 256,
+    shared: 0,
+}];
 const FLOAT_TILES: [Tile; 1] = [Tile {
     rows: 32,
     inputs: 8,
@@ -79,8 +87,10 @@ fn is_float(ty: TensorType) -> bool {
     matches!(ty, TensorType::F32 | TensorType::F16)
 }
 
-fn tiles(ty: TensorType) -> &'static [Tile] {
-    if ty == TensorType::F16 {
+fn tiles(ty: TensorType, tensor_cores: bool) -> &'static [Tile] {
+    if !tensor_cores {
+        &PASCAL_TILES
+    } else if ty == TensorType::F16 {
         &HALF_TILES
     } else if is_float(ty) {
         &FLOAT_TILES
@@ -92,17 +102,28 @@ fn tiles(ty: TensorType) -> &'static [Tile] {
 /// The matrix-product kernels of `module`, by index into `WEIGHT_TYPES` and
 /// then by width, allowed the shared memory they take; none for a type
 /// without a tiled kernel or where the device has less shared memory
-/// (Turing), so those batches run as GEMVs. Every kernel here needs tensor
-/// cores; `Kernels::load` does not call this on devices without.
-pub(crate) fn gemm_functions(module: &Rc<Module>) -> Result<Vec<Vec<Function>>> {
+/// (Turing), so those batches run as GEMVs. With `tensor_cores` they are
+/// gemm.cuh's and gemm_float.cuh's; without, gemm_pascal.cuh's f32 kernels
+/// of the quantized types.
+pub(crate) fn gemm_functions(
+    module: &Rc<Module>,
+    tensor_cores: bool,
+) -> Result<Vec<Vec<Function>>> {
     WEIGHT_TYPES
         .iter()
         .map(|&ty| {
             let Some(name) = gemm_name(ty) else {
                 return Ok(Vec::new());
             };
+            if !tensor_cores {
+                if is_float(ty) {
+                    return Ok(Vec::new());
+                }
+                let name = CString::new(format!("p{name}")).expect("kernel names have no NUL");
+                return Ok(vec![module.function(&name)?]);
+            }
             let mut fs = Vec::new();
-            for tile in tiles(ty) {
+            for tile in tiles(ty, true) {
                 let name = if is_float(ty) {
                     name.to_owned()
                 } else {
@@ -158,7 +179,7 @@ impl Kernels {
             gelu: false,
         };
         let blocks = self.gemm_grid(&p);
-        let splits = if is_float(w.ty()) {
+        let splits = if is_float(w.ty()) || !self.tensor_cores {
             1
         } else {
             self.gemm_splits(rows, w.cols() / STAGE)
@@ -212,7 +233,12 @@ impl Kernels {
         }
         out.check_rows(inputs.len())?;
         let (kernel, tile) = match self.gemm_kernel(gate, inputs.len()) {
-            Some(k) if inputs.len() > MAX_BATCH && up.ty() == gate.ty() && !is_float(gate.ty()) => {
+            Some(k)
+                if inputs.len() > MAX_BATCH
+                    && up.ty() == gate.ty()
+                    && !is_float(gate.ty())
+                    && self.tensor_cores =>
+            {
                 k
             }
             _ => return Ok(false),
@@ -239,7 +265,7 @@ impl Kernels {
         if !w.cols().is_multiple_of(STAGE) {
             return None;
         }
-        let tiles = tiles(w.ty());
+        let tiles = tiles(w.ty(), self.tensor_cores);
         let k = tiles
             .iter()
             .position(|t| n <= t.inputs as usize)
