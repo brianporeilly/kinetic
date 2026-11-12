@@ -18,7 +18,8 @@ the rules in [Versioning](https://veloresearch.github.io/kinetic/versioning.html
 - NVIDIA Pascal (GTX 10 series, Tesla P100, sm_60 and sm_61) and Volta
   (sm_70) through CUDA. Without the tensor cores the prompt kernels use,
   prompts run in batches of up to 512 tokens through f32 matrix products of
-  the quantized weights, in f16 pairs on the P100 and V100; generation runs
+  the quantized weights, in f16 pairs on the P100 and V100, and f32 attention
+  in tiles; generation runs
   the same kernels as on newer GPUs. `KINETIC_CUDA_ARCHS` (`CUDA_ARCHS` in `Dockerfile.cuda`) builds
   the kernels for chosen GPUs only.
 
