@@ -334,6 +334,22 @@ impl<'m> CudaModel<'m> {
             .as_ref()
             .map(|p| CudaPerLayer::upload(&gpu, p, model.eps))
             .transpose()?;
+        // A prediction block with routed experts of its own is left out;
+        // speculative decoding then drafts from lookups. Over several
+        // devices the block goes to the main one before the layers, so that
+        // they are placed beside it.
+        let upload_mtp = || {
+            model
+                .mtp
+                .as_ref()
+                .filter(|m| m.layer.experts.is_none())
+                .map(|m| mtp::CudaMtp::upload(&gpu, m, model.eps))
+                .transpose()
+        };
+        let early_mtp = match others.is_empty() {
+            true => None,
+            false => upload_mtp()?,
+        };
         // every device runs the same passes, so the least capable decides
         let rows = others
             .iter()
@@ -392,15 +408,12 @@ impl<'m> CudaModel<'m> {
                 layer.input = Some(CudaLayerInput::upload(&gpu, input, i, p.layers.len())?);
             }
         }
-        // A prediction block with routed experts of its own is left out, as
-        // is one after layers on the host; speculative decoding then drafts
-        // from lookups.
-        let mtp = model
-            .mtp
-            .as_ref()
-            .filter(|m| m.layer.experts.is_none() && front == 0 && shards.is_empty())
-            .map(|m| mtp::CudaMtp::upload(&gpu, m, model.eps))
-            .transpose()?;
+        // Nor does a block follow layers on the host.
+        let mtp = match (front, early_mtp) {
+            (0, Some(m)) => Some(m),
+            (0, None) if shards.is_empty() => upload_mtp()?,
+            _ => None,
+        };
         let fold = |f: &Option<Arc<Folding>>| {
             f.as_deref()
                 .map(|f| CudaFolding::upload(&gpu, f))

@@ -147,11 +147,13 @@ KINETIC_CUDA_P2P=0 kinetic run model.gguf --gpus 0,1 "Hello"
 podman run -e KINETIC_CUDA_P2P=0 ...        # in a container
 ```
 
+A model's own prediction block goes to the first GPU, with the embeddings
+and the output head, and drafts as on one GPU.
+
 For now, `--gpus` takes dense models without per-layer inputs or shared
-attention caches (not mixture-of-experts models or Gemma 4 E2B/E4B), leaves
-out the drafts of a model's own prediction block (drafts from lookups still
-run), and runs the requests of `--parallel` one after another rather than
-in shared passes.
+attention caches (not mixture-of-experts models or Gemma 4 E2B/E4B), and
+runs the requests of `--parallel` one after another rather than in shared
+passes.
 
 ## Memory
 
@@ -206,8 +208,7 @@ GPU too.
 
 - **More on Vulkan**: more architectures, speculative decoding, Warm Start
   and layer splits.
-- **Several GPUs** for mixture-of-experts models, Gemma 4 E2B/E4B,
-  prediction-block drafts and shared passes; dense models already spread over
-  them with `--gpus`.
+- **Several GPUs** for mixture-of-experts models, Gemma 4 E2B/E4B and
+  shared passes; dense models already spread over them with `--gpus`.
 
 See the [roadmap](roadmap.md).
