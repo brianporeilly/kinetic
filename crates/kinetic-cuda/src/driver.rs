@@ -87,6 +87,7 @@ entry_points! {
     module_unload = "cuModuleUnload"(CuModule);
     module_get_function = "cuModuleGetFunction"(*mut CuFunction, CuModule, *const c_char);
     func_set_attribute = "cuFuncSetAttribute"(CuFunction, c_int, c_int);
+    func_get_attribute = "cuFuncGetAttribute"(*mut c_int, c_int, CuFunction);
     launch_kernel = "cuLaunchKernel"(
         CuFunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CuStream,
         *mut *mut c_void, *mut *mut c_void
