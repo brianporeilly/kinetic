@@ -14,19 +14,40 @@ struct Words {
     int w[4];
 };
 
+// The signed bytes 0 and 2 of v (EVEN_BYTES) or 1 and 3 (ODD_BYTES) as the
+// two sign-extended 16-bit halves of a word.
+constexpr unsigned EVEN_BYTES = 0xA280;
+constexpr unsigned ODD_BYTES = 0xB391;
+
+template <unsigned SELECT>
+__device__ __forceinline__ unsigned byte_halves(unsigned v) {
+    unsigned r;
+    asm("prmt.b32 %0, %1, 0, %2;" : "=r"(r) : "r"(v), "n"(SELECT));
+    return r;
+}
+
+// c plus the products of the 16-bit halves of a and b, low with low and high
+// with high: two XMADs on Pascal, which multiplies 16-bit halves natively
+// but 32-bit integers only in several instructions.
+__device__ __forceinline__ int mad_halves(unsigned a, unsigned b, int c) {
+    int d;
+    asm("{ .reg .s16 a0, a1, b0, b1; .reg .s32 t;\n\t"
+        "mov.b32 {a0, a1}, %1;\n\t"
+        "mov.b32 {b0, b1}, %2;\n\t"
+        "mad.wide.s16 t, a0, b0, %3;\n\t"
+        "mad.wide.s16 %0, a1, b1, t; }"
+        : "=r"(d)
+        : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
 // Four signed int8 products of a and b added to c, as __dp4a. sm_60 (GP100)
-// has no dp4a instruction, so it adds the same products in integer
-// arithmetic, which gives the same bits.
+// has no dp4a instruction: there the bytes widen to 16-bit halves and
+// multiply as such, the same integers, so the same bits.
 __device__ __forceinline__ int dp4a(int a, int b, int c) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
-    const int p0 = ((a << 24) >> 24) * ((b << 24) >> 24);
-    const int p1 = ((a << 16) >> 24) * ((b << 16) >> 24);
-    const int p2 = ((a << 8) >> 24) * ((b << 8) >> 24);
-    const int p3 = (a >> 24) * (b >> 24);
-    // Wrapping adds, as the instruction's.
-    return static_cast<int>(static_cast<unsigned>(c) + static_cast<unsigned>(p0) +
-                            static_cast<unsigned>(p1) + static_cast<unsigned>(p2) +
-                            static_cast<unsigned>(p3));
+    c = mad_halves(byte_halves<EVEN_BYTES>(a), byte_halves<EVEN_BYTES>(b), c);
+    return mad_halves(byte_halves<ODD_BYTES>(a), byte_halves<ODD_BYTES>(b), c);
 #else
     return __dp4a(a, b, c);
 #endif
