@@ -64,7 +64,11 @@ cores the prompt kernels use. Prompts run there in batches of up to 512
 tokens through f32 matrix products of the quantized weights, with attention
 and the delta rule taken 16 tokens at a time, so long prompts take longer
 than on Turing and newer; generation runs the same kernels as on newer
-GPUs. The
+GPUs. On the Tesla P100 and V100 (6.0 and 7.0), whose f16 arithmetic runs at
+twice the f32 rate, the products multiply weights and inputs in pairs of f16
+values and apply the scales in f32, about 1.5 times as fast; their results
+differ from the f32 products in the last bits, as a different order of
+summation would. The
 Tesla P100 (6.0) also lacks the int8 dot product instruction, which its
 kernels do in plain integer arithmetic, with the same results and less
 speed.
