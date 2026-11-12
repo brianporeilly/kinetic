@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use kinetic_cuda::MAX_BATCH;
 use kinetic_models::cuda::{
-    CudaModel, CudaRunner, CudaState, Placement, PREFILL_BATCH, PREFILL_GRID,
+    CudaModel, CudaRunner, CudaState, Placement, PREFILL_BATCH, PREFILL_CALL, PREFILL_GRID,
 };
 use kinetic_models::speculative::{Decoder, Ensemble, Policy};
 use kinetic_models::warm::{Runner, Warm};
@@ -155,7 +155,10 @@ impl<'a> CudaBackend<'a> {
     /// starts resume where a cold prefill cuts its batches, so they give
     /// exactly its output.
     pub fn with_warm(mut self, warm: Warm<'a>) -> Self {
-        self.warm = Some(warm.aligned(PREFILL_BATCH));
+        self.warm = Some(
+            warm.aligned(PREFILL_BATCH)
+                .batches_per_call(PREFILL_CALL / PREFILL_BATCH),
+        );
         self
     }
 
@@ -274,7 +277,7 @@ impl<'a> CudaBackend<'a> {
             _ => PREFILL_GRID,
         };
         let last = start + (rest - 1) / step * step;
-        for batch in prompt[start..last].chunks(PREFILL_BATCH) {
+        for batch in prompt[start..last].chunks(PREFILL_CALL) {
             self.decoder.feed(&*self.gpu, &mut seq.state, batch);
         }
         seq.tokens.extend_from_slice(&prompt[start..last]);
@@ -302,7 +305,7 @@ impl<'a> CudaBackend<'a> {
         let mark = device(self.gpu.truncate(self.model, state, mark));
         let end = mark + (tokens.len() - mark) / PREFILL_GRID * PREFILL_GRID;
         self.decoder.reset(&*self.gpu);
-        for batch in tokens[mark..end].chunks(PREFILL_BATCH) {
+        for batch in tokens[mark..end].chunks(PREFILL_CALL) {
             self.decoder.feed(&*self.gpu, state, batch);
         }
         tokens.truncate(end);

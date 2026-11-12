@@ -186,6 +186,8 @@ pub struct Warm<'m> {
     grid: Option<usize>,
     /// Batches start at multiples of this, and so do warm starts.
     align: usize,
+    /// Aligned batches a runner is handed at once.
+    batches_per_call: usize,
     budget: usize,
     clock: u64,
     entries: Vec<Entry>,
@@ -208,6 +210,7 @@ impl<'m> Warm<'m> {
             model_id,
             grid: grid(model),
             align: 1,
+            batches_per_call: 1,
             budget: memory_bytes,
             clock: 0,
             entries: Vec::new(),
@@ -233,6 +236,14 @@ impl<'m> Warm<'m> {
     pub fn aligned(mut self, tokens: usize) -> Self {
         self.align = tokens.max(1);
         self.grid = self.grid.map(|g| g.next_multiple_of(self.align));
+        self
+    }
+
+    /// Hands the runner up to `batches` aligned batches in one call rather
+    /// than one, for runners that cut a call into the same batches and can
+    /// overlap them, such as a model split over several GPUs.
+    pub fn batches_per_call(mut self, batches: usize) -> Self {
+        self.batches_per_call = batches.max(1);
         self
     }
 
@@ -457,7 +468,8 @@ impl<'m> Warm<'m> {
     }
 
     /// Runs `tokens` in batches that end on the grid, at length `branch`
-    /// and at multiples of the alignment, marking the state on the grid and
+    /// and at multiples of the alignment, up to `batches_per_call` of
+    /// those at a time, marking the state on the grid and
     /// at `branch`, and returns the logits after the last token. Models whose
     /// caches cut back anywhere need no marks.
     fn run<R: Runner>(
@@ -478,7 +490,7 @@ impl<'m> Warm<'m> {
             });
             let cut = match self.align {
                 1 => usize::MAX,
-                align => next(len, align),
+                align => next(len, align) + (self.batches_per_call - 1) * align,
             };
             let stop = mark.unwrap_or(usize::MAX).min(cut);
             let (batch, tail) = rest.split_at((stop - len).min(rest.len()));

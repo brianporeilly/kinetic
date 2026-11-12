@@ -68,6 +68,13 @@ pub use split::Placement;
 /// Most tokens one prefill pass runs; a state keeps buffers for this many.
 pub const PREFILL_BATCH: usize = 512;
 
+/// Most tokens a server hands the model at once while running a prompt:
+/// several batches, so that over several GPUs the first runs the next batch
+/// while the last finishes this one. The model cuts them into the batches
+/// separate calls would run, so the results are the same; the host holds
+/// their hidden rows meanwhile.
+pub const PREFILL_CALL: usize = 8 * PREFILL_BATCH;
+
 /// Prompt runs give the same bits wherever they are cut on multiples of
 /// this many tokens: every kernel sums a token's terms in an order that does
 /// not depend on the batch, and the chunked recurrence starts its chunks on
