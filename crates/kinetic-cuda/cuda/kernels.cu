@@ -9,6 +9,7 @@
 #include "delta_net.cuh"
 #include "delta_scan.cuh"
 #include "embed.cuh"
+#include "exchange.cuh"
 #include "gemm.cuh"
 #include "gemm_float.cuh"
 #include "gemm_pascal.cuh"

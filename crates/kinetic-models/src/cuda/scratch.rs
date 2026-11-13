@@ -1,4 +1,4 @@
-use kinetic_cuda::{Argmax, Batch, DeviceBuffer, GemvInput, MAX_BATCH};
+use kinetic_cuda::{Argmax, Batch, DeviceBuffer, GemvInput, Mailbox, MAX_BATCH};
 
 use super::experts::ExpertWork;
 use super::layer::{CudaLayer, LayerState};
@@ -35,6 +35,9 @@ pub(super) struct Scratch {
     /// Per-layer inputs of every layer, and the token rows they start from.
     pub per_layer: DeviceBuffer<f32>,
     pub per_layer_tokens: DeviceBuffer<f32>,
+    /// Where another device's partial outputs land, in a model split by
+    /// tensors.
+    pub mailbox: Option<Mailbox>,
 }
 
 /// The input with `width` elements among `inputs`, which has one.
@@ -189,6 +192,7 @@ impl Work {
                 greedy: Argmax::new(ctx, MAX_BATCH, vocab)?,
                 per_layer: f32s(rows * per_layer)?,
                 per_layer_tokens: f32s(rows * per_layer)?,
+                mailbox: None,
             },
             layers: states,
             experts: None,
@@ -224,7 +228,12 @@ impl Work {
             .chain([&s.h])
             .map(input)
             .sum();
-        let layers: usize = self.layers.iter().map(LayerState::size_bytes).sum();
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(LayerState::size_bytes)
+            .sum::<usize>()
+            + s.mailbox.as_ref().map_or(0, Mailbox::size_bytes);
         let experts = self.experts.as_ref().map_or(0, ExpertWork::size_bytes)
             + self.pass.as_ref().map_or(0, PassRows::size_bytes);
         4 * (buffers + proj) + inputs + layers + experts
