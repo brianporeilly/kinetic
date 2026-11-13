@@ -6,7 +6,9 @@ use std::cell::Cell;
 
 use kinetic_cuda::{HostState, KvCache, Stream};
 
-use super::layer::{CudaMixer, LayerState};
+use super::layer::{CudaLayer, CudaMixer, LayerState};
+use super::scratch::Work;
+use super::tensor::{join, part_of, Held};
 use super::{CudaModel, CudaState};
 use crate::blocks::MixerState;
 use crate::device_state::{past_to_ring, ring_to_past, slots_to_window, window_to_slots};
@@ -162,11 +164,8 @@ impl CudaModel<'_> {
         let mut host = model.new_state();
         host.pos = state.pos;
         host.layers[..self.front].clone_from_slice(&state.work.front);
-        for ((layer, ls), hs) in self
-            .layer_states(&state.work)
-            .zip(&mut host.layers[self.front..])
-        {
-            let bufs = layer.mixer.save(ls, state.pos)?;
+        for (i, hs) in host.layers[self.front..].iter_mut().enumerate() {
+            let bufs = self.save_layer(&state.work, i, state.pos)?;
             for (dst, src) in hs.buffers_mut().into_iter().zip(bufs) {
                 *dst = src;
             }
@@ -192,11 +191,8 @@ impl CudaModel<'_> {
         dev.pos = state.pos;
         dev.checkpoint = None;
         dev.work.front = state.layers[..self.front].to_vec();
-        for ((_, layer, ls), hs) in self
-            .device_layers(&mut dev.work)
-            .zip(&state.layers[self.front..])
-        {
-            layer.mixer.load(ls, state.pos, &hs.buffers())?;
+        for (i, hs) in state.layers[self.front..].iter().enumerate() {
+            self.load_layer(&mut dev.work, i, state.pos, &hs.buffers())?;
         }
         dev.marks = state.marks.clone();
         Ok(())
@@ -260,9 +256,9 @@ impl CudaModel<'_> {
         }
         let marks = &state.marks;
         let saved = |i: usize| mark.and_then(|m| marks[m].layers[i].as_ref());
-        for (i, (_, layer, ls)) in self.device_layers(&mut state.work).enumerate() {
+        for i in 0..self.whole_layers() {
             if let Some(s) = saved(self.front + i) {
-                layer.mixer.load(ls, to, &s.buffers())?;
+                self.load_layer(&mut state.work, i, to, &s.buffers())?;
             }
         }
         state.marks.retain(|m| m.pos <= to);
@@ -281,14 +277,11 @@ impl CudaModel<'_> {
             .zip(&state.work.front)
             .map(|(host, ls)| host.mixer.needs_mark().then(|| ls.clone()))
             .collect();
-        for ((layer, ls), host) in self
-            .layer_states(&state.work)
-            .zip(&model.layers[self.front..])
-        {
+        for (i, host) in model.layers[self.front..].iter().enumerate() {
             layers.push(match host.mixer.needs_mark() {
                 true => {
                     let mut hs = host.mixer.new_state();
-                    let bufs = layer.mixer.save(ls, state.pos)?;
+                    let bufs = self.save_layer(&state.work, i, state.pos)?;
                     for (dst, src) in hs.buffers_mut().into_iter().zip(bufs) {
                         *dst = src;
                     }
@@ -301,6 +294,81 @@ impl CudaModel<'_> {
             pos: state.pos,
             layers,
         });
+        Ok(())
+    }
+}
+
+impl CudaModel<'_> {
+    /// Layers on the device, each counted once however it is split.
+    fn whole_layers(&self) -> usize {
+        match self.tensor {
+            true => self.layers.len(),
+            false => self.device_split().iter().sum(),
+        }
+    }
+
+    /// The parts of device layer `i` and their states in `work`: the layer
+    /// alone, or its share on each device when split by tensors.
+    fn layer_parts<'a>(&'a self, work: &'a Work, i: usize) -> Vec<(&'a CudaLayer, &'a LayerState)> {
+        match self.tensor {
+            false => self.layer_states(work).nth(i).into_iter().collect(),
+            true => std::iter::once((&self.layers[i], &work.layers[i]))
+                .chain(
+                    self.shards
+                        .iter()
+                        .zip(&work.shards)
+                        .map(|(sh, w)| (&sh.layers[i], &w.layers[i])),
+                )
+                .collect(),
+        }
+    }
+
+    /// The CPU buffers of device layer `i`'s state in `work` after `pos`
+    /// tokens, joined from its parts when split.
+    fn save_layer(&self, work: &Work, i: usize, pos: usize) -> kinetic_cuda::Result<Vec<Vec<f32>>> {
+        let parts = self.layer_parts(work, i);
+        let saved = parts
+            .iter()
+            .map(|(l, s)| l.mixer.save(s, pos))
+            .collect::<kinetic_cuda::Result<Vec<_>>>()?;
+        if parts.len() == 1 {
+            return Ok(saved.into_iter().next().expect("one part"));
+        }
+        let buffers = saved[0].len();
+        Ok((0..buffers)
+            .map(|b| {
+                let bufs: Vec<Vec<f32>> = saved.iter().map(|s| s[b].clone()).collect();
+                let held: Vec<&Held> = parts.iter().map(|(l, _)| &l.mixer.held()[b]).collect();
+                join(&bufs, &held)
+            })
+            .collect())
+    }
+
+    /// Loads device layer `i`'s state in `work` from the CPU buffers
+    /// `bufs` after `pos` tokens, a part of them on each device when split.
+    fn load_layer(
+        &self,
+        work: &mut Work,
+        i: usize,
+        pos: usize,
+        bufs: &[&[f32]],
+    ) -> kinetic_cuda::Result<()> {
+        if !self.tensor {
+            let (_, layer, ls) = self.device_layers(work).nth(i).expect("a device layer");
+            return layer.mixer.load(ls, pos, bufs).map(|_| ());
+        }
+        let shards = self.shards.iter().zip(work.shards.iter_mut());
+        let parts = std::iter::once((&self.layers[i], &mut work.layers[i]))
+            .chain(shards.map(|(sh, w)| (&sh.layers[i], &mut w.layers[i])));
+        for (layer, ls) in parts {
+            let own: Vec<Vec<f32>> = bufs
+                .iter()
+                .zip(layer.mixer.held())
+                .map(|(b, h)| part_of(b, h))
+                .collect();
+            let own: Vec<&[f32]> = own.iter().map(Vec::as_slice).collect();
+            layer.mixer.load(ls, pos, &own)?;
+        }
         Ok(())
     }
 }

@@ -11,6 +11,7 @@ use super::mamba2::CudaMamba2;
 use super::per_layer::CudaLayerInput;
 use super::scratch::{Needs, Scratch};
 use super::short_conv::CudaShortConv;
+use super::tensor::{Held, Part};
 use super::{cuda_error, Gpu};
 use crate::blocks::Mixer;
 use crate::model::Layer;
@@ -46,15 +47,20 @@ impl LayerState {
 }
 
 impl CudaMixer {
-    fn upload(gpu: &Gpu, m: &Mixer) -> Result<CudaMixer, LoadError> {
+    fn upload(gpu: &Gpu, m: &Mixer, part: Part) -> Result<CudaMixer, LoadError> {
+        if !part.is_whole() && !matches!(m, Mixer::Attention(_) | Mixer::DeltaNet(_)) {
+            return Err(LoadError(
+                "only attention and delta-rule layers split over GPUs by tensors for now".into(),
+            ));
+        }
         Ok(match m {
-            Mixer::Attention(a) => CudaMixer::Attention(CudaAttention::upload(gpu, a)?),
-            Mixer::DeltaNet(d) => CudaMixer::DeltaNet(CudaDeltaNet::upload(gpu, d)?),
+            Mixer::Attention(a) => CudaMixer::Attention(CudaAttention::upload(gpu, a, part)?),
+            Mixer::DeltaNet(d) => CudaMixer::DeltaNet(CudaDeltaNet::upload(gpu, d, part)?),
             Mixer::ShortConv(s) => CudaMixer::ShortConv(CudaShortConv::upload(gpu, s)?),
             Mixer::Mamba2(m) => CudaMixer::Mamba2(CudaMamba2::upload(gpu, m)?),
             Mixer::Parallel(ms) => CudaMixer::Parallel(
                 ms.iter()
-                    .map(|m| CudaMixer::upload(gpu, m))
+                    .map(|m| CudaMixer::upload(gpu, m, part))
                     .collect::<Result<_, _>>()?,
             ),
         })
@@ -105,13 +111,23 @@ impl CudaMixer {
         }
     }
 
+    /// Where a part's state buffers sit among the whole layer's, in the
+    /// order of its host buffers; empty for a whole layer.
+    pub fn held(&self) -> &[Held] {
+        match self {
+            CudaMixer::Attention(a) => &a.held,
+            CudaMixer::DeltaNet(d) => &d.held,
+            _ => &[],
+        }
+    }
+
     /// Whether this runs mixers side by side, whose outputs need a sum.
     pub fn is_parallel(&self) -> bool {
         matches!(self, CudaMixer::Parallel(_))
     }
 
     /// Reads `s.h` and leaves the output in `s.y`.
-    fn forward(
+    pub fn forward(
         &self,
         gpu: &Gpu,
         s: &mut Scratch,
@@ -257,24 +273,26 @@ pub(super) struct Routed<'a, 'm> {
 }
 
 impl CudaLayer {
-    /// Uploads `l`; its routed experts, if any, come as `experts`.
+    /// Uploads `part` of `l`; its routed experts, if any, come as
+    /// `experts`.
     pub fn upload(
         gpu: &Gpu,
         l: &Layer,
         experts: Option<CudaExperts>,
         eps: f32,
+        part: Part,
     ) -> Result<CudaLayer, LoadError> {
         let vector = |v: &[f32]| gpu.vector(v).map_err(cuda_error);
         let optional = |v: &Option<Vec<f32>>| v.as_deref().map(vector).transpose();
         Ok(CudaLayer {
             mixer_norm: optional(&l.mixer_norm)?,
-            mixer: CudaMixer::upload(gpu, &l.mixer)?,
+            mixer: CudaMixer::upload(gpu, &l.mixer, part)?,
             mixer_out_norm: optional(&l.mixer_out_norm)?,
             ffn_norm: optional(&l.ffn_norm)?,
             ffn: l
                 .ffn
                 .as_ref()
-                .map(|f| CudaFfn::upload(gpu, f))
+                .map(|f| CudaFfn::upload(gpu, f, part))
                 .transpose()?,
             experts,
             ffn_out_norm: optional(&l.ffn_out_norm)?,

@@ -13,6 +13,7 @@ use kinetic_cuda::KvType;
 use super::experts::DEVICE_RESERVE;
 use super::layer::CudaLayer;
 use super::scratch::Work;
+use super::tensor::Part;
 use super::{cuda_error, CudaModel, Gpu};
 use crate::blocks::MixerState;
 use crate::model::Layer;
@@ -40,6 +41,10 @@ pub struct Placement {
     /// head. Empty means device 0 alone. A device may be named twice, which
     /// splits the layers on it as if over two, for testing the split.
     pub devices: Vec<usize>,
+    /// Over several devices, splits every layer over all of them, each
+    /// holding a share of its heads and rows, instead of giving each device
+    /// a run of whole layers; see [`tensor`](super::tensor).
+    pub tensor: bool,
 }
 
 /// What [`upload_layers`] fits a run of layers beside.
@@ -131,7 +136,7 @@ fn upload_layers(
         if before < DEVICE_RESERVE + largest || start.saturating_sub(before) + largest > cap {
             break;
         }
-        match CudaLayer::upload(gpu, l, None, model.eps) {
+        match CudaLayer::upload(gpu, l, None, model.eps, Part::WHOLE) {
             Ok(layer) => uploaded.push(layer),
             // A failure past the first layer is the device running out.
             Err(_) if !uploaded.is_empty() => break,
