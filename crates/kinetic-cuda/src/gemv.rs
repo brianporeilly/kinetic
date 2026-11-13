@@ -16,8 +16,11 @@ use crate::stream::Stream;
 /// launch.
 pub const MAX_BATCH: usize = 16;
 
-/// Rows per thread block; each row gets one warp.
+/// Warps per thread block; each row gets one warp.
 const ROWS_PER_BLOCK: u32 = 4;
+/// Rows a warp takes in the f16 K-quant kernels of sm_60; must match
+/// KQ_HALF_ROWS in gemv_kquant.cuh.
+const KQ_HALF_ROWS: u32 = 2;
 /// Rows and threads per block of the tensor-core kernels.
 const MMA_ROWS: u32 = 16;
 const MMA_THREADS: u32 = 128;
@@ -428,7 +431,14 @@ impl Kernels {
             return unsafe { kernel.launch(config, stream, &mut args) };
         }
         let kernel = &self.gemv[weight_index(w.ty).ok_or(Error::Unsupported(w.ty))?][n - 1];
-        let config = LaunchConfig::linear(out_rows.div_ceil(ROWS_PER_BLOCK), 32 * ROWS_PER_BLOCK);
+        let per_warp = match w.ty {
+            TensorType::Q4K | TensorType::Q5K | TensorType::Q6K if self.half_decode => KQ_HALF_ROWS,
+            _ => 1,
+        };
+        let config = LaunchConfig::linear(
+            out_rows.div_ceil(ROWS_PER_BLOCK * per_warp),
+            32 * ROWS_PER_BLOCK,
+        );
         if float_input {
             let xp = x.x.ptr_at(first);
             let mut args = [

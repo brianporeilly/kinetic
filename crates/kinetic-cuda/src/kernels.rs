@@ -1,11 +1,13 @@
 use std::ffi::{c_void, CStr, CString};
 use std::rc::Rc;
 
+use kinetic_quant::TensorType;
+
 use crate::attention::{flash_shared, FLASH_HEADS};
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::gemm::gemm_functions;
-use crate::gemv::{GEMV_NAMES, MAX_BATCH, WEIGHT_TYPES};
+use crate::gemv::{weight_index, GEMV_NAMES, MAX_BATCH, WEIGHT_TYPES};
 use crate::memory::DeviceBuffer;
 use crate::module::{Function, LaunchConfig, Module};
 use crate::moe::{EXPERT_TYPES, MOE_NAMES};
@@ -83,6 +85,8 @@ pub struct Kernels {
     pub(crate) tensor_cores: bool,
     /// See [`Kernels::half_products`].
     pub(crate) half: bool,
+    /// See [`Kernels::half_decode`].
+    pub(crate) half_decode: bool,
 }
 
 impl Kernels {
@@ -124,6 +128,9 @@ impl Kernels {
                 .find_map(|fs| fs.first())
                 .and_then(|f| f.binary_version().ok())
                 .is_some_and(|v| v == 60 || v == 70);
+        let half_decode = gemv[weight_index(TensorType::Q6K).expect("Q6_K has a GEMV")][0]
+            .binary_version()
+            .is_ok_and(|v| v == 60);
         let attn_flash = module.function(c"attn_flash")?;
         let attn_flash = (tensor_cores
             && attn_flash
@@ -198,6 +205,7 @@ impl Kernels {
             multiprocessors: info.multiprocessors,
             tensor_cores,
             half,
+            half_decode,
         })
     }
 
@@ -208,6 +216,16 @@ impl Kernels {
     /// by token.
     pub fn large_batches(&self) -> bool {
         self.attn_flash.is_some() || !self.tensor_cores
+    }
+
+    /// Whether the Q4_K, Q5_K and Q6_K GEMVs, which decode runs, multiply
+    /// in f16 pairs: where the binary that runs is for sm_60 (the Tesla
+    /// P100), which has no int8 dot product instruction and twice the f32
+    /// rate in f16. Their results are then accurate to about one part in a
+    /// thousand of their terms rather than exact integer sums, still the
+    /// same bits for an input alone or batched.
+    pub fn half_decode(&self) -> bool {
+        self.half_decode
     }
 
     /// Whether the products of large batches multiply in f16 pairs: on

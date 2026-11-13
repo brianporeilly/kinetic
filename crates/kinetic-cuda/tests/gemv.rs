@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{gpu, Lcg};
+use common::{gpu, Gpu, Lcg};
 use half::f16;
 use kinetic_cuda::{Argmax, DeviceBuffer, DeviceMatrix, Error, GemvInput, MAX_BATCH};
 use kinetic_quant::{dequantize, Matrix, TensorType};
@@ -80,11 +80,22 @@ fn check(ty: TensorType, rows: usize, cols: usize) {
             .zip(&xe)
             .map(|(&a, &b)| (a as f64 * b as f64).abs())
             .sum();
-        let tol = 1e-5 * magnitude + 1e-6;
+        let tol = half_decode_tolerance(&gpu, ty) * magnitude + 1e-6;
         assert!(
             (got as f64 - exact).abs() <= tol,
             "{ty} row {r}: got {got}, expected {exact}"
         );
+    }
+}
+
+/// How close a GEMV of `ty` must come to the exact sum, relative to its
+/// terms: f32 rounding, or f16's where sm_60 decodes K-quants in f16 pairs.
+fn half_decode_tolerance(gpu: &Gpu, ty: TensorType) -> f64 {
+    let kquant = matches!(ty, TensorType::Q4K | TensorType::Q5K | TensorType::Q6K);
+    if kquant && gpu.kernels.half_decode() {
+        2e-3
+    } else {
+        1e-5
     }
 }
 

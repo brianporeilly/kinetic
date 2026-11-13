@@ -164,13 +164,252 @@ __device__ __forceinline__ void gemv_kq(const uint8_t* w, Q8Input x, float* y, u
     }
 }
 
+// The Tesla P100 (sm_60) has no dp4a, and the integer dot products above
+// cost it about six instructions a weight, which keeps one-token decode
+// below its memory bandwidth. There the products run in f16 pairs at twice
+// its f32 rate. A weight's unsigned integer, put in the low bits of an f16
+// as it is, is the subnormal weight * 2^-24, exact and free to form; the
+// int8 inputs are exact f16 integers. Each run of 16 products adds into an
+// f16 pair, eight terms a half, and the halves are added in f32 and scaled
+// back by 2^24, giving what the integer dot product gives, then the same
+// scales and order after it (Q6_K's stored + 32 comes out as 32 times the
+// run's input sum, exact in f16). The products and sums round to about one
+// part in a thousand of their terms; each input still gets the same bits
+// alone or batched. A warp takes KQ_HALF_ROWS rows, so each input is
+// widened to f16 once for all of them. Must match Kernels::half_decode.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 600
+constexpr bool KQ_HALF = true;
+#else
+constexpr bool KQ_HALF = false;
+#endif
+// Rows per warp of the f16 kernels; must match KQ_HALF_ROWS in gemv.rs.
+constexpr unsigned KQ_HALF_ROWS = 2;
+
+// Bytes 0 and 2 (EVEN) or 1 and 3 (ODD) of v, each in the low byte of a
+// 16-bit half above `high`.
+constexpr unsigned EVEN_F16 = 0x4240;
+constexpr unsigned ODD_F16 = 0x4341;
+
+template <unsigned SELECT>
+__device__ __forceinline__ unsigned bytes_over(unsigned v, unsigned high) {
+    unsigned r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(v), "r"(high), "n"(SELECT));
+    return r;
+}
+
+// Unsigned bytes as the f16 pair 1024 + byte, less `offset`.
+template <unsigned SELECT>
+__device__ __forceinline__ __half2 bytes_f16(unsigned v, __half2 offset) {
+    const unsigned r = bytes_over<SELECT>(v, 0x64646464u);
+    return __hsub2(*reinterpret_cast<const __half2*>(&r), offset);
+}
+
+// Unsigned bytes as the subnormal f16 pair byte * 2^-24.
+template <unsigned SELECT>
+__device__ __forceinline__ __half2 bytes_tiny(unsigned v) {
+    const unsigned r = bytes_over<SELECT>(v, 0u);
+    return *reinterpret_cast<const __half2*>(&r);
+}
+
+// Sixteen int8 inputs as f16 pairs: even[i] holds elements 4i and 4i + 2,
+// odd[i] 4i + 1 and 4i + 3.
+struct HalfRun {
+    __half2 even[4], odd[4];
+};
+
+__device__ __forceinline__ HalfRun input_run(const int8_t* p) {
+    const Words a = load_cached(p);
+    const __half2 offset = __float2half2_rn(1152.0f);  // 1024 + 128
+    HalfRun r;
+#pragma unroll
+    for (unsigned i = 0; i < 4; ++i) {
+        const unsigned u = static_cast<unsigned>(a.w[i]) ^ 0x80808080u;
+        r.even[i] = bytes_f16<EVEN_F16>(u, offset);
+        r.odd[i] = bytes_f16<ODD_F16>(u, offset);
+    }
+    return r;
+}
+
+// Sixteen unsigned weights as subnormal f16 pairs, weight * 2^-24.
+__device__ __forceinline__ HalfRun weight_run(const Words& q) {
+    HalfRun r;
+#pragma unroll
+    for (unsigned i = 0; i < 4; ++i) {
+        r.even[i] = bytes_tiny<EVEN_F16>(static_cast<unsigned>(q.w[i]));
+        r.odd[i] = bytes_tiny<ODD_F16>(static_cast<unsigned>(q.w[i]));
+    }
+    return r;
+}
+
+// The dot product of a run of weights from weight_run with 16 inputs, its
+// halves added in f32 and scaled back by 2^24.
+__device__ __forceinline__ float half_dot(const HalfRun& w, const HalfRun& x) {
+    __half2 s = __float2half2_rn(0.0f);
+#pragma unroll
+    for (unsigned i = 0; i < 4; ++i) {
+        s = __hfma2(w.even[i], x.even[i], s);
+        s = __hfma2(w.odd[i], x.odd[i], s);
+    }
+    const float2 f = __half22float2(s);
+    return __fmul_rn(__fadd_rn(f.x, f.y), 16777216.0f);
+}
+
+// The sum of 16 inputs, exact: at most 16 * 127.
+__device__ __forceinline__ float input_sum(const HalfRun& x) {
+    __half2 s = __hadd2(x.even[0], x.odd[0]);
+#pragma unroll
+    for (unsigned i = 1; i < 4; ++i) s = __hadd2(s, __hadd2(x.even[i], x.odd[i]));
+    const float2 f = __half22float2(s);
+    return __fadd_rn(f.x, f.y);
+}
+
+__device__ __forceinline__ float kq_term_f(float scale, float min, float xd, float xs, float q) {
+    return fmaf(__fmul_rn(scale, xd), q, -__fmul_rn(min, xs));
+}
+
+// Q4_K and Q5_K in f16: lane j's two runs (low and high nibbles, see
+// K4Lane) and the scale and min of its sub-block 2c + h.
+struct K4Half {
+    struct Block {
+        HalfRun lo, hi;
+        float2 group;
+    };
+    struct Input {
+        HalfRun lo, hi;
+        float2 d;
+    };
+
+    template <class F>
+    __device__ static Block load(const uint8_t* w, size_t total, size_t blk, unsigned j) {
+        const typename F::Block k = F::load(w, total, blk, j);
+        return {weight_run(k.lo), weight_run(k.hi), k4_group(k.head, j)};
+    }
+
+    __device__ static Input input(unsigned b, unsigned j, Q8Input x) {
+        const unsigned c = j / 2, h = j % 2;
+        const int8_t* xp = x.qs + b * 256 + 64 * c + 16 * h;
+        return {input_run(xp), input_run(xp + 32), __ldg(x.ds + b * 8 + 2 * c + h)};
+    }
+
+    __device__ static float term(const Block& k, const Input& x, unsigned j) {
+        float lo = half_dot(k.lo, x.lo);
+        float hi = half_dot(k.hi, x.hi);
+        lo = __fadd_rn(lo, __shfl_xor_sync(FULL_MASK, lo, 1));
+        hi = __fadd_rn(hi, __shfl_xor_sync(FULL_MASK, hi, 1));
+        return kq_term_f(k.group.x, k.group.y, x.d.x, x.d.y, j % 2 ? hi : lo);
+    }
+};
+
+struct HQ4K : K4Half {
+    __device__ static Block load(const uint8_t* w, size_t total, size_t blk, unsigned j) {
+        return K4Half::load<KqQ4K>(w, total, blk, j);
+    }
+};
+
+struct HQ5K : K4Half {
+    __device__ static Block load(const uint8_t* w, size_t total, size_t blk, unsigned j) {
+        return K4Half::load<KqQ5K>(w, total, blk, j);
+    }
+};
+
+// Q6_K in f16: lane j's two runs of 16 as stored (+ 32).
+struct HQ6K {
+    struct Block {
+        HalfRun q[2];
+        float scale[2];
+    };
+    struct Input {
+        HalfRun run[2];
+        // 32 times each run's input sum, the stored bias's share.
+        float bias[2];
+        float d;
+    };
+
+    __device__ static Block load(const uint8_t* w, size_t total, size_t blk, unsigned j) {
+        const KqQ6K::Block k = KqQ6K::load(w, total, blk, j);
+        return {{weight_run(k.q[0]), weight_run(k.q[1])}, {k.scale[0], k.scale[1]}};
+    }
+
+    __device__ static Input input(unsigned b, unsigned j, Q8Input x) {
+        const int8_t* xp = x.qs + b * 256 + 32 * j;
+        Input in;
+        in.run[0] = input_run(xp);
+        in.run[1] = input_run(xp + 16);
+#pragma unroll
+        for (unsigned r = 0; r < 2; ++r) in.bias[r] = __fmul_rn(32.0f, input_sum(in.run[r]));
+        in.d = __ldg(x.ds + b * 8 + j).x;
+        return in;
+    }
+
+    __device__ static float term(const Block& k, const Input& x, unsigned) {
+        float t[2];
+#pragma unroll
+        for (unsigned r = 0; r < 2; ++r) {
+            const float q = __fsub_rn(half_dot(k.q[r], x.run[r]), x.bias[r]);
+            t[r] = kq_term_f(k.scale[r], 0.0f, x.d, 0.0f, q);
+        }
+        return __fadd_rn(t[0], t[1]);
+    }
+};
+
+// gemv_kq in f16 pairs, KQ_HALF_ROWS rows to a warp sharing each input's
+// widening; a row's arithmetic does not depend on N or on its neighbour.
+template <class H, unsigned N>
+__device__ __forceinline__ void gemv_kq_half(const uint8_t* w, Q8Input x, float* y, unsigned rows,
+                                             unsigned blocks_per_row, size_t total) {
+    constexpr unsigned R = KQ_HALF_ROWS;
+    const unsigned row0 = (blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP) * R;
+    if (row0 >= rows) return;
+    const unsigned lane = threadIdx.x % WARP, v = lane / 8, j = lane % 8;
+    const unsigned len = blocks_per_row * 256;
+
+    float acc[R][N] = {};
+    for (unsigned base = 0; base < blocks_per_row; base += KQ_SPLIT) {
+        const unsigned b = base + v;
+        const bool active = b < blocks_per_row;
+        typename H::Block blk[R];
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) {
+            // Rows past the end repeat the last one; their sums are dropped.
+            const size_t row = min(row0 + r, rows - 1);
+            blk[r] = H::load(w, total, row * blocks_per_row + (active ? b : 0), j);
+        }
+#pragma unroll
+        for (unsigned i = 0; i < N; ++i) {
+            // Idle groups read block 0; their sums are dropped.
+            const typename H::Input in = H::input(active ? b : 0, j, batch_row(x, i, len));
+#pragma unroll
+            for (unsigned r = 0; r < R; ++r) {
+                float t = H::term(blk[r], in, j);
+#pragma unroll
+                for (unsigned o = 1; o < 8; o *= 2) t = __fadd_rn(t, __shfl_xor_sync(FULL_MASK, t, o));
+                if (active) acc[r][i] = __fadd_rn(acc[r][i], t);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r)
+#pragma unroll
+        for (unsigned i = 0; i < N; ++i) {
+            float s = __shfl_sync(FULL_MASK, acc[r][i], 0);
+#pragma unroll
+            for (unsigned p = 1; p < KQ_SPLIT; ++p) s = __fadd_rn(s, __shfl_sync(FULL_MASK, acc[r][i], 8 * p));
+            if (lane == 0 && row0 + r < rows) y[static_cast<size_t>(i) * rows + row0 + r] = s;
+        }
+}
+
+// The kernels take the f16 path where KQ_HALF holds, with KQ_HALF_ROWS rows
+// a warp (the host launches blocks of 4 warps either way).
 #define GEMV_KERNEL_KQ(name, F, N)                                                          \
     extern "C" __global__ void __launch_bounds__(128)                                       \
         name##_##N(const uint8_t* w, const int8_t* xq, const float2* xds, float* y,        \
                    unsigned rows, unsigned blocks_per_row, size_t total) {                  \
-        gemv_kq<F, N>(w, Q8Input{xq, xds}, y, rows, blocks_per_row, total);                 \
+        if constexpr (KQ_HALF)                                                              \
+            gemv_kq_half<H##F, N>(w, Q8Input{xq, xds}, y, rows, blocks_per_row, total);     \
+        else                                                                                \
+            gemv_kq<Kq##F, N>(w, Q8Input{xq, xds}, y, rows, blocks_per_row, total);         \
     }
 
-GEMV_KERNELS(GEMV_KERNEL_KQ, gemv_q4_k, KqQ4K)
-GEMV_KERNELS(GEMV_KERNEL_KQ, gemv_q5_k, KqQ5K)
-GEMV_KERNELS(GEMV_KERNEL_KQ, gemv_q6_k, KqQ6K)
+GEMV_KERNELS(GEMV_KERNEL_KQ, gemv_q4_k, Q4K)
+GEMV_KERNELS(GEMV_KERNEL_KQ, gemv_q5_k, Q5K)
+GEMV_KERNELS(GEMV_KERNEL_KQ, gemv_q6_k, Q6K)

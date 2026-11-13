@@ -141,6 +141,13 @@ fn check(gpu: &Gpu, ty: TensorType, cols: usize) {
         .enumerate()
         .map(|(i, &q)| q as f32 * ds[2 * (i / 32)])
         .collect();
+    // f16 pairs where sm_60 decodes K-quants in them
+    let kquant = matches!(ty, TensorType::Q4K | TensorType::Q5K | TensorType::Q6K);
+    let tolerance = if kquant && gpu.kernels.half_decode() {
+        2e-3
+    } else {
+        1e-5
+    };
     let mut row = vec![0.0; cols];
     for (r, &got) in y.iter().enumerate() {
         dequantize(ty, m.row(r), &mut row).unwrap();
@@ -148,7 +155,7 @@ fn check(gpu: &Gpu, ty: TensorType, cols: usize) {
         let exact: f64 = products.clone().sum();
         let magnitude: f64 = products.map(f64::abs).sum();
         assert!(
-            (got as f64 - exact).abs() <= 1e-5 * magnitude + 1e-6,
+            (got as f64 - exact).abs() <= tolerance * magnitude + 1e-6,
             "{ty} row {r}: got {got}, expected {exact}"
         );
     }
