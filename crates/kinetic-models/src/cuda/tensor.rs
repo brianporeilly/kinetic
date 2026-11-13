@@ -324,21 +324,21 @@ impl CudaModel<'_> {
         layer.back(gpu, s, n, next)
     }
 
-    /// Records a one-token step over the batch in `work`, which holds
-    /// `token`: a graph per device, the main one's ending with `head`.
+    /// Records a pass of `flow` over the batch in `main`, which holds
+    /// `tokens`: a graph per device, the main one's ending with `head`.
     pub(super) fn record_parts(
         &self,
         main: &mut Work,
         shards: &mut [Work],
-        token: &[u32],
+        tokens: &[u32],
+        flow: Flow,
         embed_on_device: bool,
         head: &mut dyn FnMut(&mut Work) -> kinetic_cuda::Result<()>,
     ) -> kinetic_cuda::Result<Vec<Graph>> {
-        let flow = Flow::Commit;
         self.hand_batch(main, shards)?;
         let a = self.gpu.stream.capture(|| {
             if embed_on_device {
-                self.embed(main, token)?;
+                self.embed(main, tokens)?;
             }
             self.queue_part(0, main, &shards[0], flow)?;
             head(main)
