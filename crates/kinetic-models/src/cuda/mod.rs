@@ -231,8 +231,8 @@ pub struct CudaState {
     pos: usize,
     checkpoint: Option<usize>,
     work: Work,
-    /// The recorded one-token step, made on first use.
-    step: Option<Step>,
+    /// The recorded short passes, each made on first use.
+    steps: Vec<Step>,
     /// Tells states apart in the recorded shared passes.
     id: u64,
     /// Host copies of recurrent layers at earlier lengths, for the warm
@@ -256,9 +256,22 @@ impl CudaState {
     }
 }
 
-/// A recorded one-token step and the host buffers it leaves its greedy
-/// token and hidden state in.
+/// Recorded passes a state keeps at most; the oldest goes first.
+const MAX_STEPS: usize = 48;
+
+/// What a recorded pass runs: its rows, how it treats recurrent state and
+/// the rows given to the head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StepKey {
+    rows: usize,
+    flow: Flow,
+    head: (usize, usize),
+}
+
+/// A recorded pass of up to [`MAX_BATCH`] tokens and the host buffers it
+/// leaves its greedy tokens and hidden states in.
 struct Step {
+    key: StepKey,
     /// One graph on one device; over several devices, one per device in
     /// turn and the head's last, which [`CudaModel::launch_step`] runs with
     /// the hand-overs between them. A graph never spans devices: drivers
@@ -618,7 +631,7 @@ impl<'m> CudaModel<'m> {
             pos: 0,
             checkpoint: None,
             work,
-            step: None,
+            steps: Vec::new(),
             id: lanes::next_id(),
             marks: Vec::new(),
         })
@@ -804,13 +817,13 @@ impl<'m> CudaModel<'m> {
         };
         let mut spare = spare.borrow_mut();
         // the decode graph reads the state's own buffers
-        let step = state.step.take();
+        let steps = std::mem::take(&mut state.steps);
         let shift = state.work.batch.grid_shift();
         spare.swap(&mut state.work);
         state.work.batch.set_grid_shift(shift);
         let out = self.forward_rows(state, tokens, all_rows, logits);
         spare.swap(&mut state.work);
-        state.step = step;
+        state.steps = steps;
         out
     }
 
@@ -868,19 +881,30 @@ impl<'m> CudaModel<'m> {
             state.work.batch.set(state.pos, chunk, &self.gpu.stream)?;
             // Experts routed on the host read their routing back, which a
             // graph cannot; embeddings read on the host are copied before.
-            let recorded = flow == Flow::Commit
-                && n == 1
-                && head.is_some()
+            let key = head.as_ref().map(|h| StepKey {
+                rows: n,
+                flow,
+                head: (h.start, h.end),
+            });
+            let recorded = n <= MAX_BATCH
+                && key.is_some()
                 && !self.routes_on_host()
                 && !self.eager
                 && !self.unrecorded.get();
             let embed_on_device = self.front == 0 && matches!(self.embd, Embeddings::Device(_));
-            if recorded && state.step.is_none() {
-                match self.record_step(&mut state.work, chunk, embed_on_device) {
-                    Ok(step) => state.step = Some(step),
+            let found = |state: &CudaState| state.steps.iter().position(|s| Some(s.key) == key);
+            if recorded && found(state).is_none() {
+                let key = key.expect("recorded passes have a head");
+                match self.record_step(&mut state.work, chunk, key, embed_on_device) {
+                    Ok(step) => {
+                        if state.steps.len() == MAX_STEPS {
+                            state.steps.remove(0);
+                        }
+                        state.steps.push(step);
+                    }
                     // perf: a driver that cannot record across devices
                     // still runs the step, a launch per kernel
-                    Err(e) if !self.shards.is_empty() => {
+                    Err(e) if !self.shards.is_empty() || n > 1 => {
                         eprintln!(
                             "kinetic: recording decode steps across GPUs failed ({e}); running them kernel by kernel"
                         );
@@ -889,19 +913,20 @@ impl<'m> CudaModel<'m> {
                     Err(e) => return Err(e),
                 }
             }
-            if recorded && state.step.is_some() {
+            let found = found(state).filter(|_| recorded);
+            if let Some(at) = found {
                 if !embed_on_device {
                     self.embed(&mut state.work, chunk)?;
                 }
-                if let Some(step) = &state.step {
-                    self.launch_step(step, &mut state.work)?;
-                    self.gpu.stream.synchronize()?;
-                    out.greedy.extend_from_slice(step.greedy.as_slice());
-                    out.hidden[done * d..][..d].copy_from_slice(step.hidden.as_slice());
-                }
+                let step = &state.steps[at];
+                let m = step.key.head.1 - step.key.head.0;
+                self.launch_step(step, &mut state.work)?;
+                self.gpu.stream.synchronize()?;
+                out.greedy.extend_from_slice(&step.greedy.as_slice()[..m]);
+                out.hidden[done * d..][..n * d].copy_from_slice(&step.hidden.as_slice()[..n * d]);
                 if logits {
                     let start = out.logits.len();
-                    out.logits.resize(start + self.n_vocab(), 0.0);
+                    out.logits.resize(start + m * self.n_vocab(), 0.0);
                     state
                         .work
                         .scratch
@@ -957,33 +982,37 @@ impl<'m> CudaModel<'m> {
         Ok(out)
     }
 
-    /// Records the one-token step over the batch in `work`, which holds
-    /// `token`, from its embedding on the device or from the embedding in
-    /// the scratch.
+    /// Records the pass `key` says over the batch in `work`, which holds
+    /// `tokens`, from their embeddings on the device or from those in the
+    /// scratch.
     fn record_step(
         &self,
         work: &mut Work,
-        token: &[u32],
+        tokens: &[u32],
+        key: StepKey,
         embed_on_device: bool,
     ) -> kinetic_cuda::Result<Step> {
         let stream = &self.gpu.stream;
-        let mut greedy = PinnedBuffer::new(&self.gpu.ctx, 1)?;
-        let mut hidden = PinnedBuffer::new(&self.gpu.ctx, self.n_embd)?;
+        let (n, flow, (lo, hi)) = (key.rows, key.flow, key.head);
+        let mut greedy = PinnedBuffer::new(&self.gpu.ctx, hi - lo)?;
+        let mut hidden = PinnedBuffer::new(&self.gpu.ctx, n * self.n_embd)?;
         let mut head = |work: &mut Work| {
             let s = &mut work.scratch;
-            self.queue_head(s, 0..1)?;
+            self.queue_head(s, lo..hi)?;
             // SAFETY: the step owns both buffers with its graphs, and they
             // are read only after the stream has passed each launch.
             unsafe {
-                greedy.download(0, s.greedy.best(), 0..1, stream)?;
-                hidden.download(0, s.h.values(), 0..self.n_embd, stream)
+                greedy.download(0, s.greedy.best(), 0..hi - lo, stream)?;
+                hidden.download(0, s.h.values(), 0..n * self.n_embd, stream)
             }
         };
         if self.tensor {
             let mut shards = std::mem::take(&mut work.shards);
-            let graphs = self.record_parts(work, &mut shards, token, embed_on_device, &mut head);
+            let graphs =
+                self.record_parts(work, &mut shards, tokens, flow, embed_on_device, &mut head);
             work.shards = shards;
             return Ok(Step {
+                key,
                 graphs: graphs?,
                 greedy,
                 hidden,
@@ -992,12 +1021,13 @@ impl<'m> CudaModel<'m> {
         if self.shards.is_empty() {
             let graph = stream.capture(|| {
                 if embed_on_device {
-                    self.embed(work, token)?;
+                    self.embed(work, tokens)?;
                 }
-                self.queue_layers(work, Flow::Commit)?;
+                self.queue_layers(work, flow)?;
                 head(work)
             })?;
             return Ok(Step {
+                key,
                 graphs: vec![graph],
                 greedy,
                 hidden,
@@ -1005,9 +1035,9 @@ impl<'m> CudaModel<'m> {
         }
         let mut graphs = vec![stream.capture(|| {
             if embed_on_device {
-                self.embed(work, token)?;
+                self.embed(work, tokens)?;
             }
-            self.queue_main(work, Flow::Commit)
+            self.queue_main(work, flow)
         })?];
         for (k, shard) in self.shards.iter().enumerate() {
             // queued now, outside the graph, so the shard's batch holds this
@@ -1017,12 +1047,13 @@ impl<'m> CudaModel<'m> {
                 shard
                     .gpu
                     .stream
-                    .capture(|| self.queue_shard(work, k, Flow::Commit))?,
+                    .capture(|| self.queue_shard(work, k, flow))?,
             );
         }
         self.hand_back(work)?;
         graphs.push(stream.capture(|| head(work))?);
         Ok(Step {
+            key,
             graphs,
             greedy,
             hidden,

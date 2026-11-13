@@ -61,12 +61,12 @@ impl CudaModel<'_> {
         match self.spare.as_ref().filter(|_| n > MAX_BATCH) {
             Some(spare) => {
                 let mut spare = spare.borrow_mut();
-                let step = state.step.take();
+                let steps = std::mem::take(&mut state.steps);
                 spare.swap(&mut state.work);
                 state.work.batch.set_grid_shift(shift);
                 let out = self.queue_image(state, rows, &grid, self.batch_rows());
                 spare.swap(&mut state.work);
-                state.step = step;
+                state.steps = steps;
                 out?;
             }
             None => self.queue_image(state, rows, &grid, self.state_rows())?,
