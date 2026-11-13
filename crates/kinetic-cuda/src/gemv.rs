@@ -16,8 +16,8 @@ use crate::stream::Stream;
 /// launch.
 pub const MAX_BATCH: usize = 16;
 
-/// Rows per thread block; each row gets one warp.
-const ROWS_PER_BLOCK: u32 = 4;
+/// Warps per thread block of the GEMV kernels.
+const WARPS_PER_BLOCK: u32 = 4;
 /// Rows and threads per block of the tensor-core kernels.
 const MMA_ROWS: u32 = 16;
 const MMA_THREADS: u32 = 128;
@@ -76,6 +76,15 @@ pub(crate) const GEMV_NAMES: [&str; WEIGHT_TYPES.len()] = [
     "gemv_q4_0",
     "gemv_pq2_0",
 ];
+
+/// Rows each warp of a GEMV of `n` inputs computes; must match
+/// `gemv_warp_rows` in common.cuh.
+fn gemv_warp_rows(n: usize) -> u32 {
+    match n {
+        0..=1 => 1,
+        _ => 2,
+    }
+}
 
 pub(crate) fn weight_index(ty: TensorType) -> Option<usize> {
     WEIGHT_TYPES.iter().position(|&t| t == ty)
@@ -428,7 +437,8 @@ impl Kernels {
             return unsafe { kernel.launch(config, stream, &mut args) };
         }
         let kernel = &self.gemv[weight_index(w.ty).ok_or(Error::Unsupported(w.ty))?][n - 1];
-        let config = LaunchConfig::linear(out_rows.div_ceil(ROWS_PER_BLOCK), 32 * ROWS_PER_BLOCK);
+        let block_rows = WARPS_PER_BLOCK * gemv_warp_rows(n);
+        let config = LaunchConfig::linear(out_rows.div_ceil(block_rows), 32 * WARPS_PER_BLOCK);
         if float_input {
             let xp = x.x.ptr_at(first);
             let mut args = [

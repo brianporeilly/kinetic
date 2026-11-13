@@ -130,38 +130,52 @@ struct KqQ6K {
     }
 };
 
-// Y = W X for N inputs; output i of row r goes to y[i * rows + r].
+// Y = W X for N inputs, a warp per R = gemv_warp_rows(N) rows as in
+// gemv_rows; output i of row r goes to y[i * rows + r].
 template <class F, unsigned N>
 __device__ __forceinline__ void gemv_kq(const uint8_t* w, Q8Input x, float* y, unsigned rows,
                                         unsigned blocks_per_row, size_t total) {
-    const unsigned row = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
-    if (row >= rows) return;
+    constexpr unsigned R = gemv_warp_rows(N);
+    const unsigned row0 = (blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP) * R;
+    if (row0 >= rows) return;
     const unsigned lane = threadIdx.x % WARP, v = lane / 8, j = lane % 8;
     const unsigned len = blocks_per_row * 256;
-    const size_t first = static_cast<size_t>(row) * blocks_per_row;
+    size_t first[R];
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r)
+        // Rows past the end repeat the last, whose sums are dropped.
+        first[r] = static_cast<size_t>(min(row0 + r, rows - 1)) * blocks_per_row;
 
-    float acc[N] = {};
+    float acc[R][N] = {};
     for (unsigned base = 0; base < blocks_per_row; base += KQ_SPLIT) {
         const unsigned b = base + v;
         const bool active = b < blocks_per_row;
-        typename F::Block blk = {};
-        if (active) blk = F::load(w, total, first + b, j);
+        typename F::Block blk[R] = {};
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r)
+            if (active) blk[r] = F::load(w, total, first[r] + b, j);
+#pragma unroll
+        for (unsigned i = 0; i < N; ++i)
+#pragma unroll
+            for (unsigned r = 0; r < R; ++r) {
+                // Idle groups read block 0 of the input; their sums are dropped.
+                float t = F::term(blk[r], active ? b : 0, j, batch_row(x, i, len));
+#pragma unroll
+                for (unsigned o = 1; o < 8; o *= 2)
+                    t = __fadd_rn(t, __shfl_xor_sync(FULL_MASK, t, o));
+                if (active) acc[r][i] = __fadd_rn(acc[r][i], t);
+            }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r)
 #pragma unroll
         for (unsigned i = 0; i < N; ++i) {
-            // Idle groups read block 0 of the input; their sums are dropped.
-            float t = F::term(blk, active ? b : 0, j, batch_row(x, i, len));
+            float s = __shfl_sync(FULL_MASK, acc[r][i], 0);
 #pragma unroll
-            for (unsigned o = 1; o < 8; o *= 2) t = __fadd_rn(t, __shfl_xor_sync(FULL_MASK, t, o));
-            if (active) acc[i] = __fadd_rn(acc[i], t);
+            for (unsigned p = 1; p < KQ_SPLIT; ++p)
+                s = __fadd_rn(s, __shfl_sync(FULL_MASK, acc[r][i], 8 * p));
+            if (lane == 0 && row0 + r < rows) y[static_cast<size_t>(i) * rows + row0 + r] = s;
         }
-    }
-#pragma unroll
-    for (unsigned i = 0; i < N; ++i) {
-        float s = __shfl_sync(FULL_MASK, acc[i], 0);
-#pragma unroll
-        for (unsigned p = 1; p < KQ_SPLIT; ++p) s = __fadd_rn(s, __shfl_sync(FULL_MASK, acc[i], 8 * p));
-        if (lane == 0) y[static_cast<size_t>(i) * rows + row] = s;
-    }
 }
 
 #define GEMV_KERNEL_KQ(name, F, N)                                                          \

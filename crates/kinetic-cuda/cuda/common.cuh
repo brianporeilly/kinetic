@@ -91,38 +91,62 @@ __device__ __forceinline__ Q8Input batch_row(Q8Input x, unsigned i, unsigned len
     return {x.qs + static_cast<size_t>(i) * len, x.ds + static_cast<size_t>(i) * len / 32};
 }
 
-// Y = W X for N input vectors with one warp per row, so each weight is read
-// once for the whole batch. `F::LANES` consecutive lanes share a weight
-// block, so a warp covers 32 / F::LANES blocks per step. `F::load` reads one
-// lane's share of a block and `F::dot` multiplies it with one input; `blk`
-// indexes the block in the whole matrix and `b` within the row, and `total`
-// is the matrix's block count, which planar layouts need to find their
-// planes. Output i of row r goes to y[i * rows + r].
+// Rows each warp of a GEMV of `n` inputs computes. A warp reads every
+// input for each of its rows, from the caches, so that with several inputs
+// that traffic outgrows the weights' own; two rows sharing a warp halve it.
+// More rows hold more sums in registers, which leaves fewer warps per SM:
+// four measured slower on the GTX 1070 and mixed on the P100. One input
+// keeps a row per warp, for the most warps over the weights. Must match
+// gemv_warp_rows in gemv.rs.
+__host__ __device__ constexpr unsigned gemv_warp_rows(unsigned n) {
+    return n >= 2 ? 2 : 1;
+}
+
+// Y = W X for N input vectors with one warp per R = gemv_warp_rows(N) rows,
+// so each weight is read once for the whole batch and each input once for
+// the warp's rows. `F::LANES` consecutive lanes share a weight block, so a
+// warp covers 32 / F::LANES blocks per step. `F::load` reads one lane's
+// share of a block and `F::dot` multiplies it with one input; `blk` indexes
+// the block in the whole matrix and `b` within the row, and `total` is the
+// matrix's block count, which planar layouts need to find their planes.
+// Output i of row r goes to y[i * rows + r].
 //
-// Each input's sum is formed in the same order whatever N is, and the adds
-// are never fused, so a vector gets bit-identical results alone or batched.
+// Each input's sum is formed in the same order whatever N and R are, and
+// the adds are never fused, so a vector gets bit-identical results alone or
+// batched.
 template <class F, unsigned N, class In>
 __device__ __forceinline__ void gemv_rows(const uint8_t* w, In x, float* y, unsigned rows,
                                           unsigned blocks_per_row, size_t total) {
-    const unsigned row = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP;
-    if (row >= rows) return;
+    constexpr unsigned R = gemv_warp_rows(N);
+    const unsigned row0 = (blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP) * R;
+    if (row0 >= rows) return;
     const unsigned lane = threadIdx.x % WARP;
     const unsigned part = lane % F::LANES;
     const unsigned len = blocks_per_row * F::ELEMS;
-    const size_t first = static_cast<size_t>(row) * blocks_per_row;
+    size_t first[R];
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r)
+        // Rows past the end repeat the last, whose sums are dropped.
+        first[r] = static_cast<size_t>(min(row0 + r, rows - 1)) * blocks_per_row;
 
-    float sum[N] = {};
+    float sum[R][N] = {};
     for (unsigned b = lane / F::LANES; b < blocks_per_row; b += WARP / F::LANES) {
-        const typename F::Block blk = F::load(w, total, first + b, part);
+        typename F::Block blk[R];
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) blk[r] = F::load(w, total, first[r] + b, part);
 #pragma unroll
         for (unsigned i = 0; i < N; ++i)
-            sum[i] = __fadd_rn(sum[i], F::dot(blk, b, part, batch_row(x, i, len)));
+#pragma unroll
+            for (unsigned r = 0; r < R; ++r)
+                sum[r][i] = __fadd_rn(sum[r][i], F::dot(blk[r], b, part, batch_row(x, i, len)));
     }
 #pragma unroll
-    for (unsigned i = 0; i < N; ++i) {
-        const float s = warp_sum(sum[i]);
-        if (lane == 0) y[static_cast<size_t>(i) * rows + row] = s;
-    }
+    for (unsigned r = 0; r < R; ++r)
+#pragma unroll
+        for (unsigned i = 0; i < N; ++i) {
+            const float s = warp_sum(sum[r][i]);
+            if (lane == 0 && row0 + r < rows) y[static_cast<size_t>(i) * rows + row0 + r] = s;
+        }
 }
 
 // One extern "C" kernel per batch size, named `<name>_<N>`.

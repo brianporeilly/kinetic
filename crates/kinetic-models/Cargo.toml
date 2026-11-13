@@ -31,6 +31,10 @@ name = "cuda_prefill"
 required-features = ["cuda"]
 
 [[example]]
+name = "cuda_kpass"
+required-features = ["cuda"]
+
+[[example]]
 name = "cuda_speculative"
 required-features = ["cuda"]
 
