@@ -5,6 +5,7 @@ use kinetic_cuda::{
 
 use super::fold::CudaFolding;
 use super::scratch::{by_width, Needs, Scratch};
+use super::tensor::{pick, scaled, upload_cols, upload_rows, Held, Part};
 use super::{cuda_error, Gpu};
 use crate::blocks::{Attention, Gate, RopeLayout, SharedKv};
 use crate::LoadError;
@@ -26,10 +27,15 @@ pub(super) struct CudaAttention {
     k_bias: Option<DeviceBuffer<f32>>,
     v_bias: Option<DeviceBuffer<f32>>,
     folding: Option<CudaFolding>,
+    /// Where a part's keys and values sit among the whole layer's; empty
+    /// for a whole layer.
+    pub held: Vec<Held>,
 }
 
 impl CudaAttention {
-    pub fn upload(gpu: &Gpu, a: &Attention) -> Result<CudaAttention, LoadError> {
+    /// Uploads `part` of `a`: its share of the key-value heads, the query
+    /// heads that read them and the output projection's columns for those.
+    pub fn upload(gpu: &Gpu, a: &Attention, part: Part) -> Result<CudaAttention, LoadError> {
         let v_norm = match &a.v_norm {
             None => false,
             Some(w) if w.iter().all(|&w| w == 1.0) => true,
@@ -40,49 +46,86 @@ impl CudaAttention {
             }
         };
         let own_kv = !matches!(a.shared_kv, SharedKv::Borrows(_));
+        let kv_heads = part.share(a.n_head_kv, "key-value heads")?;
+        let group = a.n_head / a.n_head_kv;
+        let heads = kv_heads.start * group..kv_heads.end * group;
+        let hd = a.head_dim;
+        let q_stride = match a.gate {
+            Gate::Interleaved => 2 * hd,
+            _ => hd,
+        };
+        // Norms over every head of a token need them all on one device.
+        let spans_heads = |n: &Option<Vec<f32>>| n.as_ref().is_some_and(|n| n.len() != hd);
+        if !part.is_whole()
+            && (spans_heads(&a.q_norm) || spans_heads(&a.k_norm) || a.folding.is_some())
+        {
+            return Err(LoadError(
+                "attention with norms over all heads, or stored folded, runs on one GPU for now"
+                    .into(),
+            ));
+        }
         let shape = AttentionShape {
-            n_head: a.n_head,
-            n_head_kv: a.n_head_kv,
-            head_dim: a.head_dim,
+            n_head: heads.len(),
+            n_head_kv: kv_heads.len(),
+            head_dim: hd,
             rope_dims: a.rope.dims,
             rope_base: a.rope.base,
             rope_adjacent: a.rope.layout == RopeLayout::Adjacent,
             rope_mscale: a.rope.mscale,
             norm_after_rope: a.norm_after_rope,
-            scale: a.scale.unwrap_or(1.0 / (a.head_dim as f32).sqrt()),
+            scale: a.scale.unwrap_or(1.0 / (hd as f32).sqrt()),
             eps: a.eps,
             window: a.window,
             interleaved_gate: matches!(a.gate, Gate::Interleaved),
             v_norm,
         };
-        let matrix = |m| gpu.matrix(m).map_err(cuda_error);
-        let vector = |v: &Option<Vec<f32>>| {
+        let (q_runs, kv_runs, o_runs) = (
+            scaled(std::slice::from_ref(&heads), q_stride),
+            scaled(std::slice::from_ref(&kv_heads), hd),
+            scaled(std::slice::from_ref(&heads), hd),
+        );
+        let whole = part.is_whole();
+        let rows = |m: &kinetic_quant::Matrix, runs: &[std::ops::Range<usize>]| match whole {
+            true => gpu.matrix(m).map_err(cuda_error),
+            false => upload_rows(gpu, m, runs),
+        };
+        let vector = |v: &Option<Vec<f32>>, runs: Option<&[std::ops::Range<usize>]>| {
             v.as_deref()
-                .map(|v| gpu.vector(v))
+                .map(|v| match runs.filter(|_| !whole) {
+                    Some(runs) => gpu.vector(&pick(v, runs)),
+                    None => gpu.vector(v),
+                })
                 .transpose()
                 .map_err(cuda_error)
         };
         Ok(CudaAttention {
             shape,
-            q: matrix(&a.q)?,
-            k: own_kv.then(|| matrix(&a.k)).transpose()?,
-            v: own_kv.then(|| matrix(&a.v)).transpose()?,
-            o: matrix(&a.o)?,
+            q: rows(&a.q, &q_runs)?,
+            k: own_kv.then(|| rows(&a.k, &kv_runs)).transpose()?,
+            v: own_kv.then(|| rows(&a.v, &kv_runs)).transpose()?,
+            o: match whole {
+                true => gpu.matrix(&a.o).map_err(cuda_error)?,
+                false => upload_cols(gpu, &a.o, &o_runs)?,
+            },
             head_gate: match &a.gate {
-                Gate::PerHead(g) => Some(matrix(g)?),
+                Gate::PerHead(g) => Some(rows(g, std::slice::from_ref(&heads))?),
                 Gate::Interleaved | Gate::None => None,
             },
-            q_norm: vector(&a.q_norm)?,
-            k_norm: vector(&a.k_norm)?,
-            rope_factors: vector(&a.rope.factors)?,
-            q_bias: vector(&a.q_bias)?,
-            k_bias: vector(&a.k_bias)?,
-            v_bias: vector(&a.v_bias)?,
+            q_norm: vector(&a.q_norm, None)?,
+            k_norm: vector(&a.k_norm, None)?,
+            rope_factors: vector(&a.rope.factors, None)?,
+            q_bias: vector(&a.q_bias, Some(&q_runs))?,
+            k_bias: vector(&a.k_bias, Some(&kv_runs))?,
+            v_bias: vector(&a.v_bias, Some(&kv_runs))?,
             folding: a
                 .folding
                 .as_deref()
                 .map(|f| CudaFolding::upload(gpu, f))
                 .transpose()?,
+            held: match whole {
+                true => Vec::new(),
+                false => vec![Held::new(kv_runs.clone(), a.n_head_kv * hd); 2],
+            },
         })
     }
 

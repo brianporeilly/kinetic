@@ -5,6 +5,7 @@ use kinetic_cuda::{
 
 use super::fold::CudaFolding;
 use super::scratch::{by_width, Needs, Scratch};
+use super::tensor::{pick, scaled, shifted, upload_cols, upload_rows, Held, Part};
 use super::{cuda_error, Gpu};
 use crate::blocks::DeltaNet;
 use crate::LoadError;
@@ -22,35 +23,85 @@ pub(super) struct CudaDeltaNet {
     a: DeviceBuffer<f32>,
     norm: DeviceBuffer<f32>,
     folding: Option<CudaFolding>,
+    /// Where a part's state and window sit among the whole layer's; empty
+    /// for a whole layer.
+    pub held: Vec<Held>,
 }
 
 impl CudaDeltaNet {
-    pub fn upload(gpu: &Gpu, d: &DeltaNet) -> Result<CudaDeltaNet, LoadError> {
-        let matrix = |m| gpu.matrix(m).map_err(cuda_error);
-        let vector = |v: &[f32]| gpu.vector(v).map_err(cuda_error);
+    /// Uploads `part` of `d`: its share of the key heads and of the value
+    /// heads that read them, which, tiled over the key heads, come in a run
+    /// per tile.
+    pub fn upload(gpu: &Gpu, d: &DeltaNet, part: Part) -> Result<CudaDeltaNet, LoadError> {
+        if !part.is_whole() && d.folding.is_some() {
+            return Err(LoadError(
+                "delta-rule layers stored folded run on one GPU for now".into(),
+            ));
+        }
+        let (nk, nv, hk, hv) = (d.n_k_heads, d.n_v_heads, d.head_k_dim, d.head_v_dim);
+        let k_heads = part.share(nk, "delta-rule key heads")?;
+        // value head h reads key head h % nk
+        let v_heads: Vec<_> = (0..nv / nk)
+            .map(|t| t * nk + k_heads.start..t * nk + k_heads.end)
+            .collect();
+        let key_dim = nk * hk;
+        let k_runs = scaled(std::slice::from_ref(&k_heads), hk);
+        let v_runs = scaled(&v_heads, hv);
+        let channels: Vec<_> = k_runs
+            .iter()
+            .cloned()
+            .chain(shifted(&k_runs, key_dim))
+            .chain(shifted(&v_runs, 2 * key_dim))
+            .collect();
+        let whole = part.is_whole();
+        let rows = |m: &kinetic_quant::Matrix, runs: &[std::ops::Range<usize>]| match whole {
+            true => gpu.matrix(m).map_err(cuda_error),
+            false => upload_rows(gpu, m, runs),
+        };
+        let vector = |v: &[f32], runs: &[std::ops::Range<usize>]| {
+            match whole {
+                true => gpu.vector(v),
+                false => gpu.vector(&pick(v, runs)),
+            }
+            .map_err(cuda_error)
+        };
         Ok(CudaDeltaNet {
             shape: DeltaShape {
-                n_k_heads: d.n_k_heads,
-                n_v_heads: d.n_v_heads,
-                head_k_dim: d.head_k_dim,
-                head_v_dim: d.head_v_dim,
+                n_k_heads: k_heads.len(),
+                n_v_heads: total_len(&v_heads),
+                head_k_dim: hk,
+                head_v_dim: hv,
                 conv_taps: d.conv_taps,
                 eps: d.eps,
             },
-            qkv: matrix(&d.qkv)?,
-            z: matrix(&d.z)?,
-            beta: matrix(&d.beta)?,
-            alpha: matrix(&d.alpha)?,
-            out: matrix(&d.out)?,
-            conv: vector(&d.conv)?,
-            dt_bias: vector(&d.dt_bias)?,
-            a: vector(&d.a)?,
-            norm: vector(&d.norm)?,
+            qkv: rows(&d.qkv, &channels)?,
+            z: rows(&d.z, &v_runs)?,
+            beta: rows(&d.beta, &v_heads)?,
+            alpha: rows(&d.alpha, &v_heads)?,
+            out: match whole {
+                true => gpu.matrix(&d.out).map_err(cuda_error)?,
+                false => upload_cols(gpu, &d.out, &v_runs)?,
+            },
+            conv: vector(&d.conv, &scaled(&channels, d.conv_taps))?,
+            dt_bias: vector(&d.dt_bias, &v_heads)?,
+            a: vector(&d.a, &v_heads)?,
+            norm: gpu.vector(&d.norm).map_err(cuda_error)?,
             folding: d
                 .folding
                 .as_deref()
                 .map(|f| CudaFolding::upload(gpu, f))
                 .transpose()?,
+            held: match whole {
+                true => Vec::new(),
+                false => {
+                    let channels_all = 2 * key_dim + nv * hv;
+                    let past = d.conv_taps - 1;
+                    vec![
+                        Held::new(scaled(&v_heads, hv * hk), nv * hv * hk),
+                        Held::new(scaled(&channels, past), channels_all * past),
+                    ]
+                }
+            },
         })
     }
 
@@ -171,4 +222,8 @@ impl CudaDeltaNet {
         gpu.kernels
             .delta_replay(self.params(), state, keep, &gpu.stream)
     }
+}
+
+fn total_len(runs: &[std::ops::Range<usize>]) -> usize {
+    runs.iter().map(|r| r.len()).sum()
 }

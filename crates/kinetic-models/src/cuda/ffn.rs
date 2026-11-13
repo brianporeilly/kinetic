@@ -2,6 +2,7 @@ use kinetic_cuda::DeviceMatrix;
 
 use super::fold::CudaFolding;
 use super::scratch::{by_width, Needs, Scratch};
+use super::tensor::{upload_cols, upload_rows, Part};
 use super::{cuda_error, Gpu};
 use crate::blocks::{Activation, SwiGlu};
 use crate::LoadError;
@@ -16,12 +17,32 @@ pub(super) struct CudaFfn {
 }
 
 impl CudaFfn {
-    pub fn upload(gpu: &Gpu, f: &SwiGlu) -> Result<CudaFfn, LoadError> {
+    /// Uploads `part` of `f`: its share of the hidden rows.
+    pub fn upload(gpu: &Gpu, f: &SwiGlu, part: Part) -> Result<CudaFfn, LoadError> {
         let matrix = |m| gpu.matrix(m).map_err(cuda_error);
+        if part.is_whole() {
+            return Ok(CudaFfn {
+                gate: matrix(&f.gate)?,
+                up: matrix(&f.up)?,
+                down: matrix(&f.down)?,
+                activation: f.activation,
+                folding: f
+                    .folding
+                    .as_deref()
+                    .map(|f| CudaFolding::upload(gpu, f))
+                    .transpose()?,
+            });
+        }
+        if f.folding.is_some() {
+            return Err(LoadError(
+                "feed-forwards stored folded run on one GPU for now".into(),
+            ));
+        }
+        let rows = [part.share(f.gate.rows, "feed-forward rows")?];
         Ok(CudaFfn {
-            gate: matrix(&f.gate)?,
-            up: matrix(&f.up)?,
-            down: matrix(&f.down)?,
+            gate: upload_rows(gpu, &f.gate, &rows)?,
+            up: upload_rows(gpu, &f.up, &rows)?,
+            down: upload_cols(gpu, &f.down, &rows)?,
             activation: f.activation,
             folding: f
                 .folding

@@ -5,6 +5,7 @@ use kinetic_cuda::{DeviceBuffer, DeviceMatrix, Flow, RmsNorm, MAX_BATCH};
 use super::host::clear_layer;
 use super::layer::CudaLayer;
 use super::scratch::{Spare, Work};
+use super::tensor::Part;
 use super::{batches, cuda_error, shape, CudaModel, Gpu};
 use crate::model::Mtp;
 use crate::LoadError;
@@ -28,7 +29,7 @@ impl CudaMtp {
             eh_proj: gpu.matrix(&m.eh_proj).map_err(cuda_error)?,
             embd_norm: vector(&m.embd_norm)?,
             hidden_norm: vector(&m.hidden_norm)?,
-            layer: CudaLayer::upload(gpu, &m.layer, None, eps)?,
+            layer: CudaLayer::upload(gpu, &m.layer, None, eps, Part::WHOLE)?,
             head_norm: vector(&m.head_norm)?,
             spare: None,
         })

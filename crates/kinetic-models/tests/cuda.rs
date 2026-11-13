@@ -70,6 +70,27 @@ fn batches_and_rollbacks_change_no_bit() {
         assert!(long_prompt(&spread) == whole_long, "{devices:?}");
     }
 
+    // Every layer split over two devices by heads and rows: the partial
+    // outputs add up in another order, so the results are close, not equal,
+    // but batches, rollbacks and host copies still change no bit.
+    let placement = Placement {
+        devices: vec![0, 0],
+        tensor: true,
+        ..Placement::default()
+    };
+    match CudaModel::load_with(&model, LONG + 8, placement) {
+        Err(e) => eprintln!("not split by tensors: {e}"),
+        Ok(tensor) => {
+            assert_close(&floats(&logits(&tensor)), &floats(&whole), "logits");
+            let (hidden, last) = long_prompt(&tensor);
+            assert_close(&floats(&hidden), &floats(&whole_long.0), "long hidden");
+            assert_close(&floats(&last), &floats(&whole_long.1), "long logits");
+            a_batch_matches_token_by_token(&tensor);
+            rollback_leaves_the_state_as_if_never_run(&tensor);
+            a_host_copy_restores_the_state(&tensor, &model);
+        }
+    }
+
     // Half the layers on the host, as when the device is too small.
     let layers = model.n_layers();
     let placement = Placement {
@@ -92,6 +113,19 @@ fn batches_and_rollbacks_change_no_bit() {
     assert!(capped.host_layers() > 0 && capped.host_layers() < layers);
     assert!(capped.weight_bytes() <= full / 2);
     a_batch_matches_token_by_token(&capped);
+}
+
+fn floats(bits: &[u32]) -> Vec<f32> {
+    bits.iter().map(|&b| f32::from_bits(b)).collect()
+}
+
+/// Fails unless `x` is within a small fraction of `y`'s largest value of it.
+fn assert_close(x: &[f32], y: &[f32], what: &str) {
+    assert_eq!(x.len(), y.len(), "{what}");
+    let scale = y.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let worst = x.iter().zip(y).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    eprintln!("{what}: largest difference {worst} against values up to {scale}");
+    assert!(worst <= 0.05 * scale, "{what}: {worst} against {scale}");
 }
 
 /// Tokens of the long prompt: more than two full prefill batches.
