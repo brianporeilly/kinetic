@@ -38,7 +38,7 @@ impl CudaFfn {
                 "feed-forwards stored folded run on one GPU for now".into(),
             ));
         }
-        let rows = [part.ffn_share(f.gate.rows)?];
+        let rows = [part.share(f.gate.rows, "feed-forward rows")?];
         Ok(CudaFfn {
             gate: upload_rows(gpu, &f.gate, &rows)?,
             up: upload_rows(gpu, &f.up, &rows)?,

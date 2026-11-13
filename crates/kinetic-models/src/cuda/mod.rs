@@ -401,26 +401,15 @@ impl<'m> CudaModel<'m> {
                 (embd, 0, layers)
             }
             None if tensor => {
-                let embd = Embeddings::Device(table()?);
+                // A row per token comes from the host instead: the main
+                // device has the head and any prediction block besides.
+                let embd = match tied {
+                    true => Embeddings::Device(table()?),
+                    false => Embeddings::Host,
+                };
                 let ranks = others.len() + 1;
-                // The main device holds the embeddings, the head and any
-                // prediction block: it takes fewer feed-forward rows, so
-                // both are left with the same free memory.
-                let free = |g: &Gpu| g.ctx.memory_info().map(|(f, _)| f as f64);
-                let extra =
-                    free(&others[0].0).map_err(cuda_error)? - free(&gpu).map_err(cuda_error)?;
-                let ffn: usize = model
-                    .layers
-                    .iter()
-                    .filter_map(|l| l.ffn.as_ref())
-                    .map(|f| f.gate.data.len() + f.up.data.len() + f.down.data.len())
-                    .sum();
-                let first = tensor::ffn_first(extra, ffn as f64);
                 let upload = |g: &Gpu, rank: usize| -> Result<Vec<CudaLayer>, LoadError> {
-                    let part = Part {
-                        ffn_first: first,
-                        ..Part::even(rank, ranks)
-                    };
+                    let part = Part { rank, ranks };
                     model
                         .layers
                         .iter()
