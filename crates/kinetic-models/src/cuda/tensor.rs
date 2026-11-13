@@ -21,16 +21,38 @@ use super::scratch::{Scratch, Work};
 use super::{cuda_error, CudaModel, Gpu, Step};
 use crate::LoadError;
 
-/// Which share of a layer a device holds: `rank` of `ranks` equal ones.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which share of a layer a device holds: `rank` of `ranks` equal ones of
+/// its heads; of its feed-forward rows, over two devices, the first holds
+/// `ffn_first` of them, rounded to whole blocks, which evens out the memory
+/// the main device's embeddings and head take.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Part {
     pub rank: usize,
     pub ranks: usize,
+    pub ffn_first: f64,
 }
+
+/// Feed-forward rows go to devices in multiples of this many, the longest
+/// block of a quantized row, so that the output projection's columns split
+/// on whole blocks.
+const FFN_ROWS: usize = 256;
 
 impl Part {
     /// The whole layer, on one device.
-    pub const WHOLE: Part = Part { rank: 0, ranks: 1 };
+    pub const WHOLE: Part = Part {
+        rank: 0,
+        ranks: 1,
+        ffn_first: 1.0,
+    };
+
+    /// Share `rank` of `ranks` equal ones.
+    pub fn even(rank: usize, ranks: usize) -> Part {
+        Part {
+            rank,
+            ranks,
+            ffn_first: 1.0 / ranks as f64,
+        }
+    }
 
     pub fn is_whole(&self) -> bool {
         self.ranks == 1
@@ -47,6 +69,30 @@ impl Part {
         }
         let each = n / self.ranks;
         Ok(self.rank * each..(self.rank + 1) * each)
+    }
+
+    /// This part's run of `n` feed-forward rows.
+    pub fn ffn_share(&self, n: usize) -> Result<Range<usize>, LoadError> {
+        if self.ranks != 2 || !n.is_multiple_of(FFN_ROWS) {
+            return self.share(n, "feed-forward rows");
+        }
+        let blocks = n / FFN_ROWS;
+        let first = ((blocks as f64 * self.ffn_first).round() as usize).clamp(1, blocks - 1);
+        Ok(match self.rank {
+            0 => 0..first * FFN_ROWS,
+            _ => first * FFN_ROWS..n,
+        })
+    }
+}
+
+/// The share of the feed-forward rows the main device takes, of two, so
+/// that both are left with about the same free memory: `extra` bytes
+/// already taken on the main device beyond the other's, and `ffn` bytes of
+/// feed-forward weights over all layers.
+pub(super) fn ffn_first(extra: f64, ffn: f64) -> f64 {
+    match ffn > 0.0 {
+        true => (0.5 - extra / (2.0 * ffn)).clamp(0.05, 0.95),
+        false => 0.5,
     }
 }
 
