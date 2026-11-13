@@ -43,7 +43,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use kinetic_cuda::{
-    Batch, Context, Device, DeviceBuffer, DeviceMatrix, Event, Graph, Kernels, KvType,
+    Batch, Context, Device, DeviceBuffer, DeviceMatrix, Event, Graph, Kernels, KvType, Mailbox,
     PinnedBuffer, Stream, MAX_BATCH,
 };
 
@@ -476,8 +476,7 @@ impl<'m> CudaModel<'m> {
             convoy: Convoy::for_device(),
             spare: None,
             shared_step: RefCell::new(None),
-            // prototype: the sums between devices are not recorded yet
-            eager: placement.eager || tensor,
+            eager: placement.eager,
             unrecorded: Cell::new(false),
             staging: RefCell::new(None),
         };
@@ -636,13 +635,14 @@ impl<'m> CudaModel<'m> {
                 self.folded,
             )?;
             if self.tensor {
-                // where the other device's partial outputs come over
-                w.scratch.sum = DeviceBuffer::new(&shard.gpu.ctx, rows * d)?;
+                let blocks = self.exchange_blocks();
+                w.scratch.mailbox = Some(Mailbox::new(&shard.gpu.ctx, rows * d, blocks)?);
             }
             work.shards.push(w);
         }
         if self.tensor {
-            work.scratch.sum = DeviceBuffer::new(&self.gpu.ctx, rows * d)?;
+            let blocks = self.exchange_blocks();
+            work.scratch.mailbox = Some(Mailbox::new(&self.gpu.ctx, rows * d, blocks)?);
         }
         if self.host.grid_rope {
             work.batch.use_grid();
@@ -963,6 +963,16 @@ impl<'m> CudaModel<'m> {
                 hidden.download(0, s.h.values(), 0..self.n_embd, stream)
             }
         };
+        if self.tensor {
+            let mut shards = std::mem::take(&mut work.shards);
+            let graphs = self.record_parts(work, &mut shards, token, embed_on_device, &mut head);
+            work.shards = shards;
+            return Ok(Step {
+                graphs: graphs?,
+                greedy,
+                hidden,
+            });
+        }
         if self.shards.is_empty() {
             let graph = stream.capture(|| {
                 if embed_on_device {
@@ -1010,6 +1020,9 @@ impl<'m> CudaModel<'m> {
         let [main, rest @ ..] = step.graphs.as_slice() else {
             unreachable!("a step has a graph")
         };
+        if self.tensor {
+            return self.launch_parts(step, work);
+        }
         main.launch(stream)?;
         let Some((head, shards)) = rest.split_last() else {
             return Ok(());

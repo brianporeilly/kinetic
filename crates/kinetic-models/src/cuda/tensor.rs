@@ -14,11 +14,11 @@
 
 use std::ops::Range;
 
-use kinetic_cuda::{DeviceMatrix, Flow};
+use kinetic_cuda::{DeviceMatrix, Exchange, Flow, Graph, EXCHANGE_BLOCKS};
 use kinetic_quant::Matrix;
 
-use super::scratch::Work;
-use super::{cuda_error, CudaModel, Gpu};
+use super::scratch::{Scratch, Work};
+use super::{cuda_error, CudaModel, Gpu, Step};
 use crate::LoadError;
 
 /// Which share of a layer a device holds: `rank` of `ranks` equal ones.
@@ -156,6 +156,20 @@ pub(super) fn part_of(whole: &[f32], held: &Held) -> Vec<f32> {
 }
 
 impl CudaModel<'_> {
+    /// Blocks each exchange runs on: one when both parts share a device, so
+    /// that a waiting exchange leaves room for the other part's kernels.
+    pub(super) fn exchange_blocks(&self) -> usize {
+        let same = self
+            .shards
+            .iter()
+            .any(|s| s.gpu.ctx.device() == self.gpu.ctx.device());
+        if same {
+            1
+        } else {
+            EXCHANGE_BLOCKS
+        }
+    }
+
     /// Queues every layer over the batch in `work`, whose embeddings are in
     /// the main device's scratch, split over the devices; leaves the
     /// normalized stream in the main device's `h`, for the head.
@@ -166,85 +180,151 @@ impl CudaModel<'_> {
         out
     }
 
+    /// Queues both devices' shares, a stretch between exchanges at a time:
+    /// a pass may wait on the host for its device, which must not wait for
+    /// an exchange whose other end is not queued yet.
     fn queue_parts(
         &self,
         main: &mut Work,
         shards: &mut [Work],
         flow: Flow,
     ) -> kinetic_cuda::Result<()> {
-        let n = main.batch.len();
-        let len = n * self.n_embd;
-        let ([peer], [other]) = (self.shards.as_slice(), shards) else {
-            unreachable!("tensor splits run over two devices")
-        };
-        let (a, b) = (&self.gpu, &peer.gpu);
-        // The batch and the embeddings go over to the other device.
-        a.handoff.record(&a.stream)?;
-        b.stream.wait(&a.handoff)?;
-        other.batch.copy_from(&main.batch, &b.stream)?;
-        other
-            .scratch
-            .x
-            .copy_from_device(0, &main.scratch.x, 0..len, &b.stream)?;
-        b.copied.record(&b.stream)?;
-        a.stream.wait(&b.copied)?;
-
-        let ranks = [
-            (a, &self.layers, &self.output_norm),
-            (b, &peer.layers, &peer.output_norm),
-        ];
-        let mut works = [main, other];
-        for ((gpu, layers, _), w) in ranks.iter().zip(works.iter_mut()) {
-            let s = &mut w.scratch;
-            layers[0].input(gpu, &s.x, &mut s.h, n)?;
-        }
-        for i in 0..self.layers.len() {
-            for ((gpu, layers, _), w) in ranks.iter().zip(works.iter_mut()) {
-                let w = &mut **w;
-                layers[i]
-                    .mixer
-                    .forward(gpu, &mut w.scratch, &mut w.layers[i], flow, &w.batch)?;
-            }
-            sum_partials(a, b, &mut works, len)?;
-            for ((gpu, layers, _), w) in ranks.iter().zip(works.iter_mut()) {
-                layers[i].feed(gpu, &mut w.scratch, n)?;
-            }
-            sum_partials(a, b, &mut works, len)?;
-            for ((gpu, layers, norm), w) in ranks.iter().zip(works.iter_mut()) {
-                let next = match layers.get(i + 1) {
-                    Some(l) => l.mixer_norm.as_ref(),
-                    None => Some(*norm),
-                };
-                layers[i].back(gpu, &mut w.scratch, n, next)?;
-            }
+        self.hand_batch(main, shards)?;
+        for stretch in 0..self.stretches() {
+            self.queue_stretch(0, stretch, main, &shards[0], flow)?;
+            self.queue_stretch(1, stretch, &mut shards[0], main, flow)?;
         }
         Ok(())
     }
+
+    /// Queues the copy of the main device's batch to the other's, once the
+    /// main device has written it; the main device then waits for the copy
+    /// before it writes the next.
+    fn hand_batch(&self, main: &Work, shards: &mut [Work]) -> kinetic_cuda::Result<()> {
+        let (a, b) = (&self.gpu, &self.shards[0].gpu);
+        a.handoff.record(&a.stream)?;
+        b.stream.wait(&a.handoff)?;
+        shards[0].batch.copy_from(&main.batch, &b.stream)?;
+        b.copied.record(&b.stream)?;
+        a.stream.wait(&b.copied)
+    }
+
+    /// Stretches of a pass that each end with an exchange: taking the
+    /// embeddings, then each layer's mixer and its feed-forward.
+    fn stretches(&self) -> usize {
+        1 + 2 * self.layers.len()
+    }
+
+    /// Queues the batch in `w`, which holds the main device's embeddings
+    /// there, through device `rank`'s share of every layer, exchanging
+    /// partial outputs with the device of `peer`; the main device is left
+    /// with the normalized stream, for the head.
+    fn queue_part(
+        &self,
+        rank: usize,
+        w: &mut Work,
+        peer: &Work,
+        flow: Flow,
+    ) -> kinetic_cuda::Result<()> {
+        (0..self.stretches())
+            .try_for_each(|stretch| self.queue_stretch(rank, stretch, w, peer, flow))
+    }
+
+    /// Queues stretch `stretch` of [`CudaModel::queue_part`].
+    fn queue_stretch(
+        &self,
+        rank: usize,
+        stretch: usize,
+        w: &mut Work,
+        peer: &Work,
+        flow: Flow,
+    ) -> kinetic_cuda::Result<()> {
+        let (gpu, layers, norm) = match rank {
+            0 => (&self.gpu, &self.layers, &self.output_norm),
+            r => {
+                let s = &self.shards[r - 1];
+                (&s.gpu, &s.layers, &s.output_norm)
+            }
+        };
+        let n = w.batch.len();
+        let len = n * self.n_embd;
+        let s = &mut w.scratch;
+        if stretch == 0 {
+            let (Some(own), Some(other)) = (&s.mailbox, &peer.scratch.mailbox) else {
+                unreachable!("works split by tensors have mailboxes")
+            };
+            let embed = match rank {
+                0 => Exchange::Keep,
+                _ => Exchange::Take,
+            };
+            gpu.kernels
+                .exchange(&mut s.x, own, other, embed, len, &gpu.stream)?;
+            return layers[0].input(gpu, &s.x, &mut s.h, n);
+        }
+        let i = (stretch - 1) / 2;
+        let layer = &layers[i];
+        if stretch % 2 == 1 {
+            layer
+                .mixer
+                .forward(gpu, s, &mut w.layers[i], flow, &w.batch)?;
+            return sum(gpu, s, peer, len);
+        }
+        layer.feed(gpu, s, n)?;
+        sum(gpu, s, peer, len)?;
+        let next = match layers.get(i + 1) {
+            Some(l) => l.mixer_norm.as_ref(),
+            None => Some(norm),
+        };
+        layer.back(gpu, s, n, next)
+    }
+
+    /// Records a one-token step over the batch in `work`, which holds
+    /// `token`: a graph per device, the main one's ending with `head`.
+    pub(super) fn record_parts(
+        &self,
+        main: &mut Work,
+        shards: &mut [Work],
+        token: &[u32],
+        embed_on_device: bool,
+        head: &mut dyn FnMut(&mut Work) -> kinetic_cuda::Result<()>,
+    ) -> kinetic_cuda::Result<Vec<Graph>> {
+        let flow = Flow::Commit;
+        self.hand_batch(main, shards)?;
+        let a = self.gpu.stream.capture(|| {
+            if embed_on_device {
+                self.embed(main, token)?;
+            }
+            self.queue_part(0, main, &shards[0], flow)?;
+            head(main)
+        })?;
+        let b = self.shards[0]
+            .gpu
+            .stream
+            .capture(|| self.queue_part(1, &mut shards[0], main, flow))?;
+        Ok(vec![a, b])
+    }
+
+    /// Replays `step`, recorded by [`CudaModel::record_parts`], on the batch
+    /// in `work`.
+    pub(super) fn launch_parts(&self, step: &Step, work: &mut Work) -> kinetic_cuda::Result<()> {
+        let [a, b] = step.graphs.as_slice() else {
+            unreachable!("a graph per device")
+        };
+        let mut shards = std::mem::take(&mut work.shards);
+        let handed = self.hand_batch(work, &mut shards);
+        work.shards = shards;
+        handed?;
+        a.launch(&self.gpu.stream)?;
+        b.launch(&self.shards[0].gpu.stream)
+    }
 }
 
-/// Adds up the partial outputs `y` of the first `len` values on devices
-/// `a` and `b`, whose works are `works`, so that both hold the sum: each
-/// copies the other's into its `sum` and adds it. Both add the same two
-/// values, so the sums have the same bits.
-fn sum_partials(
-    a: &Gpu,
-    b: &Gpu,
-    works: &mut [&mut Work; 2],
-    len: usize,
-) -> kinetic_cuda::Result<()> {
-    let [wa, wb] = works;
-    let (sa, sb) = (&mut wa.scratch, &mut wb.scratch);
-    a.handoff.record(&a.stream)?;
-    b.handoff.record(&b.stream)?;
-    a.stream.wait(&b.handoff)?;
-    sa.sum.copy_from_device(0, &sb.y, 0..len, &a.stream)?;
-    a.copied.record(&a.stream)?;
-    b.stream.wait(&a.handoff)?;
-    sb.sum.copy_from_device(0, &sa.y, 0..len, &b.stream)?;
-    b.copied.record(&b.stream)?;
-    // neither overwrites its partial before the other has copied it
-    a.stream.wait(&b.copied)?;
-    a.kernels.add(&mut sa.y, &sa.sum, len, &a.stream)?;
-    b.stream.wait(&a.copied)?;
-    b.kernels.add(&mut sb.y, &sb.sum, len, &b.stream)
+/// Queues the exchange that adds the peer's partial outputs to those in
+/// `s.y`, the first `len` values.
+fn sum(gpu: &Gpu, s: &mut Scratch, peer: &Work, len: usize) -> kinetic_cuda::Result<()> {
+    let (Some(own), Some(other)) = (&s.mailbox, &peer.scratch.mailbox) else {
+        unreachable!("works split by tensors have mailboxes")
+    };
+    gpu.kernels
+        .exchange(&mut s.y, own, other, Exchange::Add, len, &gpu.stream)
 }

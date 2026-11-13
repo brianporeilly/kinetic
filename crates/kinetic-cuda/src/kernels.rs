@@ -70,6 +70,7 @@ pub struct Kernels {
     pub(crate) ssm_scan: Function,
     pub(crate) ssm_gated_norm: Function,
     pub(crate) add_f32: Function,
+    pub(crate) exchange: Function,
     pub(crate) quantize_q8k: Function,
     /// Routed-expert kernels by weight type; see `moe.rs`.
     pub(crate) moe_gate_up: [Function; EXPERT_TYPES.len()],
@@ -188,6 +189,7 @@ impl Kernels {
             ssm_scan: module.function(c"ssm_scan")?,
             ssm_gated_norm: module.function(c"ssm_gated_norm")?,
             add_f32: module.function(c"add_f32")?,
+            exchange: module.function(c"exchange")?,
             quantize_q8k: module.function(c"quantize_q8k")?,
             moe_gate_up: moe("moe_gate_up")?,
             moe_down: moe("moe_down")?,
