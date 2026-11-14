@@ -31,6 +31,9 @@ pub struct CudaBackend<'a> {
     cached: Option<Sequence<CudaState>>,
     /// The length `cached` had when it began to run ahead of a request.
     ahead: Option<usize>,
+    /// The prompt length of the reply that ends `cached`, while that reply
+    /// still holds the sums of decode steps; see [`CudaBackend::settle`].
+    unsettled: Option<usize>,
     warm: Option<Warm<'a>>,
     cpu: CpuBackend<'a>,
     device: String,
@@ -125,6 +128,7 @@ impl<'a> CudaBackend<'a> {
                 tokens: Vec::new(),
             }),
             ahead: None,
+            unsettled: None,
             warm: None,
             cpu: CpuBackend::new(model),
             model,
@@ -195,6 +199,7 @@ impl<'a> CudaBackend<'a> {
             device: self.device.clone(),
             max_draft: self.max_draft,
             ahead: None,
+            unsettled: None,
         })
     }
 
@@ -211,6 +216,8 @@ impl<'a> CudaBackend<'a> {
         prompt: &[u32],
         policy: &mut impl Policy<CudaModel<'a>>,
     ) -> (Sequence<CudaState>, usize, Option<Keep>) {
+        self.settle_for(prompt);
+        self.unsettled = None;
         self.rewind(prompt);
         // The batches a cold prefill runs before its last one.
         let head = &prompt[..(prompt.len() - 1) / PREFILL_BATCH * PREFILL_BATCH];
@@ -303,12 +310,53 @@ impl<'a> CudaBackend<'a> {
         let Sequence { state, tokens } = seq;
         let mark = (prompt - 1) / PREFILL_GRID * PREFILL_GRID;
         let mark = device(self.gpu.truncate(self.model, state, mark));
-        let end = mark + (tokens.len() - mark) / PREFILL_GRID * PREFILL_GRID;
+        let end = settled_end(mark, tokens.len());
         self.decoder.reset(&*self.gpu);
         for batch in tokens[mark..end].chunks(PREFILL_CALL) {
             self.decoder.feed(&*self.gpu, state, batch);
         }
         tokens.truncate(end);
+    }
+
+    /// The tokens of the cached sequence that a request may continue: once
+    /// its reply is settled, those up to the last point on the grid.
+    fn settled_tokens(&self) -> &[u32] {
+        let Some(seq) = &self.cached else {
+            return &[];
+        };
+        match self.unsettled {
+            Some(prompt) => {
+                let mark = (prompt - 1) / PREFILL_GRID * PREFILL_GRID;
+                &seq.tokens[..settled_end(mark, seq.tokens.len())]
+            }
+            None => &seq.tokens,
+        }
+    }
+
+    /// Settles the reply that ends the cached sequence, if it is not yet,
+    /// when `prompt` continues the sequence: the reply runs again only
+    /// before a request that goes on from it, not before the response ends.
+    /// A sequence that `prompt` leaves is cleared, since its reply could not
+    /// be continued exactly; one `prompt` stops short in waits for the next.
+    fn settle_for(&mut self, prompt: &[u32]) {
+        let Some(len) = self.unsettled else {
+            return;
+        };
+        let settled = self.settled_tokens();
+        let goes_on = prompt.starts_with(settled);
+        if !goes_on && settled.starts_with(prompt) {
+            return;
+        }
+        self.unsettled = None;
+        let mut seq = self.cached.take().expect("an unsettled sequence");
+        if goes_on {
+            self.settle(&mut seq, len);
+        } else {
+            self.decoder.reset(&*self.gpu);
+            device(self.gpu.reset_state(&mut seq.state));
+            seq.tokens.clear();
+        }
+        self.cached = Some(seq);
     }
 
     /// A new sequence run up to the end of `prompt` with the token after it
@@ -320,6 +368,7 @@ impl<'a> CudaBackend<'a> {
         policy: &mut impl Policy<CudaModel<'a>>,
     ) -> Sequence<CudaState> {
         self.decoder.reset(&*self.gpu);
+        self.unsettled = None;
         let old = self.cached.take().map(|s| s.state);
         let mut state = self.empty_state(old);
         let last = prompt.len() - 1;
@@ -401,6 +450,7 @@ impl<'a> CudaBackend<'a> {
     }
 
     fn ahead_of(&mut self, prompt: &[u32]) -> usize {
+        self.settle_for(prompt);
         self.rewind(prompt);
         let fresh = self.warm.is_some();
         let cached = self.cached.as_ref();
@@ -446,6 +496,12 @@ impl<'a> CudaBackend<'a> {
     }
 }
 
+/// Where settling a reply that a sequence of `len` tokens ends, from `mark`
+/// on, leaves the sequence: at the last point on the grid.
+fn settled_end(mark: usize, len: usize) -> usize {
+    mark + (len - mark) / PREFILL_GRID * PREFILL_GRID
+}
+
 fn device<T>(r: kinetic_cuda::Result<T>) -> T {
     r.unwrap_or_else(|e| panic!("CUDA: {e}"))
 }
@@ -470,7 +526,6 @@ impl<'a> Run<CudaModel<'a>> for CudaBackend<'a> {
         let generated =
             sequence::decode(&*self.gpu, &mut self.decoder, policy, &mut seq, job, emit);
         let decode = start.elapsed();
-        self.settle(&mut seq, prompt.len());
         if let (Some(warm), Some(k)) = (self.warm.as_mut(), keep) {
             // The state is kept in memory either way; a failed disk write
             // only means the next run starts colder.
@@ -478,6 +533,8 @@ impl<'a> Run<CudaModel<'a>> for CudaBackend<'a> {
         }
         // placeholder tokens do not tell images apart
         self.cached = job.images.is_empty().then_some(seq);
+        // settled when a request goes on from it, which spares the others
+        self.unsettled = self.cached.is_some().then_some(prompt.len());
         self.ahead = None;
         Timings {
             prompt_tokens: prompt.len(),
@@ -508,10 +565,11 @@ impl Backend for CudaBackend<'_> {
     }
 
     fn reuses(&self, prompt: &[u32]) -> usize {
-        self.cached
-            .as_ref()
-            .filter(|s| s.continues(prompt) && !s.tokens.is_empty())
-            .map_or(0, |s| s.tokens.len())
+        let tokens = self.settled_tokens();
+        match prompt.len() > tokens.len() && prompt.starts_with(tokens) {
+            true => tokens.len(),
+            false => 0,
+        }
     }
 
     fn run_ahead(&mut self, prompt: &[u32]) -> usize {
