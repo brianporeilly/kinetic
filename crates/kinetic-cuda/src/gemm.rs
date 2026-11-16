@@ -76,6 +76,14 @@ const FLOAT_TILES: [Tile; 1] = [Tile {
 }];
 /// Elements per stage of the k loop; every row length must be a multiple.
 const STAGE: usize = 128;
+/// Without tensor cores, in f16 pairs: batches of at least this many inputs
+/// expand their weights to f16 once and multiply those, with tiles of
+/// `PF16_ROWS` rows and `PF16_COLS` inputs and rows unpacked
+/// `PUNPACK_ROWS` to a block; must match gemm_pascal.cuh.
+const UNPACK_INPUTS: usize = 256;
+const PF16_ROWS: u32 = 128;
+const PF16_COLS: u32 = 64;
+const PUNPACK_ROWS: u32 = 64;
 /// Inputs the split of the k axis is chosen for: a full prompt batch.
 const SPLIT_INPUTS: u32 = 512;
 
@@ -149,6 +157,7 @@ pub(crate) fn gemm_functions(
                 return Ok(vec![
                     named(format!("p{name}"))?,
                     named(format!("p{name}_wide"))?,
+                    named(format!("p{name}_unpack"))?,
                 ]);
             }
             let mut fs = Vec::new();
@@ -198,6 +207,12 @@ impl Kernels {
         let Some((kernel, tile)) = self.gemm_kernel(w, inputs.len()) else {
             return Ok(false);
         };
+        if self.half
+            && inputs.len() >= UNPACK_INPUTS
+            && self.gemm_unpacked(w, rows, x, &inputs, y, stream)?
+        {
+            return Ok(true);
+        }
         let p = Product {
             w,
             up: None,
@@ -326,6 +341,98 @@ impl Kernels {
             (p.inputs.len() as u32).div_ceil(tile.inputs),
             (p.rows as u32).div_ceil(rows),
         ]
+    }
+
+    /// Queues `y = w[..rows] x[inputs]` in f16 pairs as two launches: the
+    /// rows expanded to f16, into this stream's buffer of them, then the
+    /// product of those, with the bits of the product in one launch. Returns
+    /// `false`, queuing nothing, where the type has no such kernels or the
+    /// buffer cannot grow.
+    fn gemm_unpacked(
+        &self,
+        w: &DeviceMatrix,
+        rows: usize,
+        x: &GemvInput,
+        inputs: &Range<usize>,
+        y: &mut DeviceBuffer<f32>,
+        stream: &Stream,
+    ) -> Result<bool> {
+        let (Some(product), Some(unpack)) = (
+            &self.pgemm_f16w,
+            weight_index(w.ty()).and_then(|i| self.gemm.get(i)?.get(2)),
+        ) else {
+            return Ok(false);
+        };
+        let len = rows * w.cols();
+        let key = stream.raw() as usize;
+        let mut unpacked = self.unpacked.borrow_mut();
+        let found = unpacked.iter().position(|(k, _)| *k == key);
+        let at = match found {
+            Some(at) if unpacked[at].1.len() >= len => at,
+            _ => {
+                // perf: a model that fits only without this buffer keeps to
+                // the kernel that expands its weights in every tile
+                let Ok(grown) = DeviceBuffer::new(stream.context(), len) else {
+                    return Ok(false);
+                };
+                match found {
+                    Some(at) => {
+                        unpacked[at].1 = grown;
+                        at
+                    }
+                    None => {
+                        unpacked.push((key, grown));
+                        unpacked.len() - 1
+                    }
+                }
+            }
+        };
+        let buf = &unpacked[at].1;
+        let (wp, out) = (w.data().device_ptr(), buf.device_ptr());
+        let (r, cols, total) = (rows as u32, w.cols() as u32, w.total_blocks());
+        let config = LaunchConfig::linear(r.div_ceil(PUNPACK_ROWS), 256);
+        // SAFETY: matches `p<format>_unpack(const uint8_t*, __half*,
+        // unsigned, unsigned, size_t)`; `w` holds at least `rows` rows of
+        // `cols`, a multiple of the stage, and the buffer `rows * cols`
+        // values.
+        unsafe {
+            unpack.launch(
+                config,
+                stream,
+                &mut [arg(&wp), arg(&out), arg(&r), arg(&cols), arg(&total)],
+            )?;
+        }
+        let first = inputs.start * x.width();
+        let (xp, dp) = (
+            x.quantized().ptr_at(first),
+            x.block_scales().ptr_at(first / 16),
+        );
+        let (yp, n) = (y.device_ptr(), inputs.len() as u32);
+        let config = LaunchConfig {
+            grid: [n.div_ceil(PF16_COLS), r.div_ceil(PF16_ROWS), 1],
+            block: [256, 1, 1],
+            shared_bytes: 0,
+        };
+        // SAFETY: matches `pgemm_f16w(const __half*, const int8_t*, const
+        // float2*, float*, unsigned, unsigned, unsigned)`; the buffer holds
+        // `rows` rows of `cols` values, `x` the inputs, as the caller
+        // checked, and `y` their `n * rows` outputs.
+        unsafe {
+            product.launch(
+                config,
+                stream,
+                &mut [
+                    arg(&out),
+                    arg(&xp),
+                    arg(&dp),
+                    arg(&yp),
+                    arg(&r),
+                    arg(&cols),
+                    arg(&n),
+                ],
+            )
+        }?;
+        Ok(true)
     }
 
     fn launch_gemm(

@@ -286,6 +286,168 @@ __device__ __forceinline__ void pgemm(const uint8_t* w, Q8Input x, float* y, uns
 // Wide tiles: 8 by 8 in f16 pairs, 8 by 4 in f32.
 constexpr unsigned PGEMM_WIDE_TC = PGEMM_HALF ? 8 : 4;
 
+// Rows `rows` of `w` expanded to f16 into `out`, row-major, each row `cols`
+// values: the f16 weights pgemm_expand writes to shared memory, from the
+// same decoders and arithmetic, for pgemm_f16w. grid ceil(rows / 64),
+// block PGEMM_THREADS; `cols` is a multiple of GEMM_K.
+constexpr unsigned PUNPACK_ROWS = PGEMM_THREADS / GEMM_PARTS;
+
+template <class F>
+__device__ __forceinline__ void pgemm_unpack(const uint8_t* w, __half* out, unsigned rows,
+                                             unsigned cols, size_t total) {
+    __shared__ PGemmStage<PUNPACK_ROWS> st;
+    const unsigned row0 = blockIdx.x * PUNPACK_ROWS, stages = cols / GEMM_K;
+    // decoding: thread (own, u) reads part u of row own
+    const unsigned own = threadIdx.x / GEMM_PARTS, u = threadIdx.x % GEMM_PARTS;
+    const size_t blk = static_cast<size_t>(min(row0 + own, rows - 1)) * (cols / F::BLOCK);
+    // expanding, as pgemm_expand: thread t takes elements 8 (t % 4) .. + 7
+    // of each sub-block of row t / 4
+    const unsigned row = threadIdx.x / 4, part = threadIdx.x % 4;
+    const unsigned run = F::RUNS == 2 ? part / 2 : 0;
+    typename F::Raw raw;
+    F::load(raw, w, total, blk, 0, u);
+    for (unsigned k = 0; k < stages; ++k) {
+        __syncthreads();  // the previous stage is read
+        F::store(raw, st, own, k, u);
+        if (k + 1 < stages) F::load(raw, w, total, blk, k + 1, u);
+        __syncthreads();
+        if (row0 + row >= rows) continue;
+#pragma unroll
+        for (unsigned s = 0; s < GEMM_SUBS; ++s) {
+            const float a = pgemm_scale(st, s, run, row);
+            const float b = F::MINS ? pgemm_scale(st, s, 1, row) : 0.0f;
+            const int2 q = *reinterpret_cast<const int2*>(&st.w[row][32 * s + 8 * part]);
+            const unsigned words[2] = {static_cast<unsigned>(q.x), static_cast<unsigned>(q.y)};
+            __half2 h[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                float v[2];
+#pragma unroll
+                for (unsigned j = 0; j < 2; ++j) {
+                    const unsigned at = 2 * i + j;
+                    const float e = static_cast<float>(static_cast<int8_t>(words[at / 4] >> (8 * (at % 4))));
+                    v[j] = F::MINS ? fmaf(a, e, b) : a * e;
+                }
+                h[i] = __floats2half2_rn(v[0], v[1]);
+            }
+            const size_t at = static_cast<size_t>(row0 + row) * cols + k * GEMM_K + 32 * s + 8 * part;
+            *reinterpret_cast<uint4*>(out + at) = *reinterpret_cast<const uint4*>(h);
+        }
+    }
+}
+
+// Y = W X from weights pgemm_unpack expanded: the f16-pair products of
+// pgemm_sub, term for term and in the same order, so the results have the
+// bits of pgemm's. With the weights already expanded, a sub-block of 32 is
+// a plain copy to shared memory, which leaves room for two: each thread
+// reads the next one's weights and inputs from global memory while the
+// block multiplies this one, with one barrier per sub-block. A block of
+// 256 threads takes 128 rows by 64 inputs, each thread 8 rows by 4 inputs
+// in groups of four 64 apart, as pgemm_at. grid (ceil(n / 64),
+// ceil(rows / 128)).
+constexpr unsigned PF16_TR = 8, PF16_TC = 4;
+constexpr unsigned PF16_ROWS = 16 * PF16_TR, PF16_COLS = 16 * PF16_TC;
+
+struct __align__(16) PF16Buf {
+    __half2 w[16][PF16_ROWS + PGEMM_PAD];
+    __half2 x[16][PF16_COLS + PGEMM_PAD];
+    float d[PF16_COLS];
+};
+
+extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 2)
+    pgemm_f16w(const __half* w, const int8_t* xq, const float2* xds, float* y, unsigned rows,
+               unsigned cols, unsigned n) {
+    __shared__ PF16Buf sh[2];
+    const unsigned t = threadIdx.x, row0 = blockIdx.y * PF16_ROWS, in0 = blockIdx.x * PF16_COLS;
+    const unsigned subs = cols / 32;
+    // loading: thread t reads half t % 2 of a sub-block of row t / 2, and
+    // of input t / 2 when there is one; rows and inputs past the end repeat
+    // the last one, and their results are not stored
+    const unsigned lr = t / 2, lp = t % 2;
+    const bool loads_x = lr < PF16_COLS;
+    const __half* wrow = w + static_cast<size_t>(min(row0 + lr, rows - 1)) * cols + 16 * lp;
+    const size_t xin = min(in0 + (loads_x ? lr : 0), n - 1);
+    const int8_t* xrow = xq + xin * cols + 16 * lp;
+    const float2* drow = xds + xin * subs;
+    uint4 wr[2], xr = make_uint4(0, 0, 0, 0);
+    float dr = 0.0f;
+    auto fetch = [&](unsigned s) {
+        const uint4* p = reinterpret_cast<const uint4*>(wrow + 32 * s);
+        wr[0] = __ldg(p);
+        wr[1] = __ldg(p + 1);
+        if (loads_x) {
+            xr = __ldg(reinterpret_cast<const uint4*>(xrow + 32 * s));
+            dr = __ldg(drow + s).x;
+        }
+    };
+    auto put = [&](PF16Buf& b) {
+        const __half2* h = reinterpret_cast<const __half2*>(wr);
+#pragma unroll
+        for (unsigned p = 0; p < 8; ++p) b.w[8 * lp + p][lr] = h[p];
+        if (loads_x) {
+            const unsigned words[4] = {xr.x, xr.y, xr.z, xr.w};
+#pragma unroll
+            for (unsigned p = 0; p < 8; ++p) {
+                const unsigned word = words[p / 2] >> (16 * (p % 2));
+                b.x[8 * lp + p][lr] = __floats2half2_rn(static_cast<float>(static_cast<int8_t>(word)),
+                                                       static_cast<float>(static_cast<int8_t>(word >> 8)));
+            }
+            if (lp == 0) b.d[lr] = dr;
+        }
+    };
+    const unsigned tr = t / 16, tc = t % 16;
+    float acc[PF16_TR][PF16_TC] = {};
+    fetch(0);
+    put(sh[0]);
+    __syncthreads();
+    for (unsigned s = 0; s < subs; ++s) {
+        if (s + 1 < subs) fetch(s + 1);
+        const PF16Buf& b = sh[s % 2];
+        __half2 h[PF16_TR][PF16_TC];
+#pragma unroll
+        for (unsigned i = 0; i < PF16_TR; ++i)
+#pragma unroll
+            for (unsigned j = 0; j < PF16_TC; ++j) h[i][j] = __float2half2_rn(0.0f);
+#pragma unroll 4
+        for (unsigned e = 0; e < 16; ++e) {
+            unsigned wu[PF16_TR], xu[PF16_TC];
+#pragma unroll
+            for (unsigned g = 0; g < PF16_TR / 4; ++g)
+                *reinterpret_cast<uint4*>(&wu[4 * g]) = *reinterpret_cast<const uint4*>(&b.w[e][pgemm_at(tr, 4 * g)]);
+#pragma unroll
+            for (unsigned g = 0; g < PF16_TC / 4; ++g)
+                *reinterpret_cast<uint4*>(&xu[4 * g]) = *reinterpret_cast<const uint4*>(&b.x[e][pgemm_at(tc, 4 * g)]);
+#pragma unroll
+            for (unsigned i = 0; i < PF16_TR; ++i)
+#pragma unroll
+                for (unsigned j = 0; j < PF16_TC; ++j)
+                    h[i][j] = __hfma2(*reinterpret_cast<const __half2*>(&wu[i]),
+                                      *reinterpret_cast<const __half2*>(&xu[j]), h[i][j]);
+        }
+        float d[PF16_TC];
+#pragma unroll
+        for (unsigned g = 0; g < PF16_TC / 4; ++g)
+            *reinterpret_cast<float4*>(&d[4 * g]) = *reinterpret_cast<const float4*>(&b.d[pgemm_at(tc, 4 * g)]);
+#pragma unroll
+        for (unsigned i = 0; i < PF16_TR; ++i)
+#pragma unroll
+            for (unsigned j = 0; j < PF16_TC; ++j) {
+                const float2 f = __half22float2(h[i][j]);
+                acc[i][j] = fmaf(d[j], f.x + f.y, acc[i][j]);
+            }
+        // the other buffer was last read before the previous barrier
+        if (s + 1 < subs) put(sh[(s + 1) % 2]);
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned i = 0; i < PF16_TR; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < PF16_TC; ++j) {
+            const unsigned row = row0 + pgemm_at(tr, i), in = in0 + pgemm_at(tc, j);
+            if (row < rows && in < n) y[static_cast<size_t>(in) * rows + row] = acc[i][j];
+        }
+}
+
 // The signature of gemm.cuh's kernels, so that gemm.rs launches both alike;
 // `up`, `yq`, `yds` and `gelu_gate` are unused (gated products are not
 // fused here). `name` takes 64 by 64 tiles, `name_wide` 128 by 128 (128
@@ -302,6 +464,10 @@ constexpr unsigned PGEMM_WIDE_TC = PGEMM_HALF ? 8 : 4;
                     float* y, int8_t*, float2*, unsigned rows, unsigned cols, size_t total,     \
                     unsigned n, unsigned) {                                                     \
         pgemm<F, 8, PGEMM_WIDE_TC>(w, Q8Input{xq, xds}, y, rows, cols, total, n);               \
+    }                                                                                           \
+    extern "C" __global__ void __launch_bounds__(PGEMM_THREADS)                                 \
+        name##_unpack(const uint8_t* w, __half* out, unsigned rows, unsigned cols, size_t total) { \
+        pgemm_unpack<F>(w, out, rows, cols, total);                                             \
     }
 
 PGEMM_KERNEL(pgemm_q4_k, GemmK4<false>)

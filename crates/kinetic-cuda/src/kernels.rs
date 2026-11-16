@@ -32,6 +32,11 @@ pub struct Kernels {
     /// Matrix products for larger batches, by weight type and tile width,
     /// where the device has the shared memory they need.
     pub(crate) gemm: Vec<Vec<Function>>,
+    /// Without tensor cores: the product of weights expanded to f16 by the
+    /// `unpack` kernels in `gemm`, and the f16 weights of each stream that
+    /// has used it, grown as needed; see [`Kernels::gemm`].
+    pub(crate) pgemm_f16w: Option<Function>,
+    pub(crate) unpacked: std::cell::RefCell<Vec<(usize, DeviceBuffer<u16>)>>,
     pub(crate) quantize_q8: Function,
     pub(crate) fold_rows: Function,
     pub(crate) unfold_rows: Function,
@@ -152,6 +157,10 @@ impl Kernels {
             gemv,
             gemv_mma,
             gemm,
+            pgemm_f16w: (!tensor_cores)
+                .then(|| module.function(c"pgemm_f16w"))
+                .transpose()?,
+            unpacked: std::cell::RefCell::new(Vec::new()),
             quantize_q8: module.function(c"quantize_q8")?,
             fold_rows: module.function(c"fold_rows")?,
             unfold_rows: module.function(c"unfold_rows")?,
