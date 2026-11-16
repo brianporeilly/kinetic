@@ -71,7 +71,7 @@ supported, with kernels for compute capability 6.0, 6.1, 7.0, 7.5, 8.0, 8.6,
 8.9, 9.0 and 12.0, and PTX that newer drivers compile for later GPUs.
 
 Pascal and Volta (compute capability 6.x and 7.0) have none of the tensor
-cores the prompt kernels use. Prompts run there in batches of up to 512
+cores the prompt kernels use. Prompts run there in batches of up to 1024
 tokens through f32 matrix products of the quantized weights and f32
 attention in tiles of 64 queries, with the delta rule in chunks of 32
 tokens in f32 (and attention to heads of 64 taken 16 tokens at a time), so

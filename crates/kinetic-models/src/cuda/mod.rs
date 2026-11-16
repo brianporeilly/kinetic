@@ -68,7 +68,7 @@ pub use mtp::CudaMtpState;
 pub use split::Placement;
 
 /// Most tokens one prefill pass runs; a state keeps buffers for this many.
-pub const PREFILL_BATCH: usize = 512;
+pub const PREFILL_BATCH: usize = 1024;
 
 /// Most tokens a server hands a model split over several GPUs at once while
 /// running a prompt: several batches, so that the first GPU runs the next
@@ -518,8 +518,9 @@ impl<'m> CudaModel<'m> {
                 model.page_in_experts();
             }
         } else if cuda.batch_rows() > MAX_BATCH {
-            // perf: one set of 512-row buffers instead of one per sequence,
-            // ~230 MB each on Qwen3.5-4B, lets --parallel 4 fit in 6 GB
+            // perf: one set of full-batch buffers instead of one per
+            // sequence; with 512-token batches, ~230 MB each on Qwen3.5-4B,
+            // that let --parallel 4 fit in 6 GB
             let spare = cuda.new_work(cuda.batch_rows()).map_err(cuda_error)?;
             cuda.spare = Some(RefCell::new(Spare::new(spare)));
             if let Some(spare) = cuda.new_mtp_work(cuda.batch_rows()).map_err(cuda_error)? {
