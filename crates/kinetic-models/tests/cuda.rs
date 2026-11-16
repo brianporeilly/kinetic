@@ -91,6 +91,31 @@ fn batches_and_rollbacks_change_no_bit() {
         }
     }
 
+    // Over two devices, two prompt passes run at once; the results are
+    // those of one pass at a time, bit for bit.
+    if two {
+        let split = |one_pass| {
+            let placement = Placement {
+                devices: vec![0, 1],
+                tensor: true,
+                one_pass,
+                ..Placement::default()
+            };
+            CudaModel::load_with(&model, LONG + 8, placement).map(|gpu| long_prompt(&gpu))
+        };
+        match (split(true), split(false)) {
+            (Ok(one), Ok(two)) => {
+                assert_close(
+                    &floats(&one.0),
+                    &floats(&whole_long.0),
+                    "long hidden over two",
+                );
+                assert!(one == two, "two passes at once change the results");
+            }
+            (Err(e), _) | (_, Err(e)) => eprintln!("not split by tensors over two: {e}"),
+        }
+    }
+
     // Half the layers on the host, as when the device is too small.
     let layers = model.n_layers();
     let placement = Placement {

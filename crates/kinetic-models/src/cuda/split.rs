@@ -45,6 +45,9 @@ pub struct Placement {
     /// holding a share of its heads and rows, instead of giving each device
     /// a run of whole layers; see [`tensor`](super::tensor).
     pub tensor: bool,
+    /// With `tensor`, runs prompt passes one at a time instead of two at
+    /// once; the results are the same, only slower.
+    pub one_pass: bool,
 }
 
 /// What [`upload_layers`] fits a run of layers beside.

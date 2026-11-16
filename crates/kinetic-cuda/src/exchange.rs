@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::kernels::{launch_struct, Kernels};
 use crate::memory::DeviceBuffer;
 use crate::module::LaunchConfig;
-use crate::stream::Stream;
+use crate::stream::{Event, Stream};
 
 /// Most blocks an exchange runs on.
 pub const EXCHANGE_BLOCKS: usize = 32;
@@ -44,6 +44,42 @@ impl Mailbox {
 
     pub fn size_bytes(&self) -> usize {
         4 * (self.values.len() + self.flags.len() + self.count.len())
+    }
+}
+
+/// One device's end of exchanges that the copy engines carry, for passes
+/// that are not recorded into graphs: the values cross on a copy stream of
+/// their own while the device runs other work, and events order the steps,
+/// so no kernel waits on the peer. Each exchange is queued in two steps on
+/// both devices, [`Kernels::send`] on both before [`Kernels::receive`] on
+/// either, since a stream can only wait for an event already queued.
+pub struct Courier {
+    copy: Stream,
+    /// Where the peer's values land.
+    inbox: DeviceBuffer<f32>,
+    /// Recorded once the values to send are written.
+    ready: Event,
+    /// Recorded once they are in the peer's inbox.
+    landed: Event,
+    /// Recorded once this device has read its inbox, which the peer waits
+    /// for before it writes there again.
+    taken: Event,
+}
+
+impl Courier {
+    /// A courier for exchanges of up to `cap` values.
+    pub fn new(ctx: &Rc<Context>, cap: usize) -> Result<Courier> {
+        Ok(Courier {
+            copy: Stream::new(ctx)?,
+            inbox: DeviceBuffer::new(ctx, cap.max(1))?,
+            ready: Event::new(ctx)?,
+            landed: Event::new(ctx)?,
+            taken: Event::new(ctx)?,
+        })
+    }
+
+    pub fn size_bytes(&self) -> usize {
+        4 * self.inbox.len()
     }
 }
 
@@ -119,5 +155,71 @@ impl Kernels {
         // buffers are written from this device, which the caller lets
         // reach them.
         unsafe { launch_struct(&self.exchange, config, stream, &args) }
+    }
+
+    /// Queues the first step of an exchange through the copy engines: the
+    /// first `len` values of `y`, once `stream` has written them, go to
+    /// the peer's inbox on `own`'s copy stream, after the peer has read
+    /// what it was last sent. A device that takes the peer's values without
+    /// giving any ([`Exchange::Take`]) sends nothing.
+    pub fn send(
+        &self,
+        y: &DeviceBuffer<f32>,
+        how: Exchange,
+        len: usize,
+        own: &Courier,
+        peer: &Courier,
+        stream: &Stream,
+    ) -> Result<()> {
+        y.check_holds(len, "exchanged values")?;
+        peer.inbox.check_holds(len, "peer's inbox")?;
+        if how == Exchange::Take || len == 0 {
+            return Ok(());
+        }
+        own.ready.record(stream)?;
+        own.copy.wait(&own.ready)?;
+        own.copy.wait(&peer.taken)?;
+        let api = own.copy.context().enter()?;
+        // SAFETY: both ranges hold `len` values, as checked; unified
+        // addressing tells the driver the inbox is on the peer, which this
+        // device may reach. The peer reads it only after `landed`.
+        api.check("cuMemcpyAsync", unsafe {
+            (api.memcpy_async)(
+                peer.inbox.device_ptr(),
+                y.device_ptr(),
+                4 * len,
+                own.copy.raw(),
+            )
+        })?;
+        own.landed.record(&own.copy)
+    }
+
+    /// Queues the second step of the exchange [`Kernels::send`] began: once
+    /// this device's values have left and the peer's are in `own`'s inbox,
+    /// `stream` adds them to the first `len` values of `y` or takes them,
+    /// as `how` says. Nothing queued after it on `stream` changes the values
+    /// before they have left.
+    pub fn receive(
+        &self,
+        y: &mut DeviceBuffer<f32>,
+        how: Exchange,
+        len: usize,
+        own: &Courier,
+        peer: &Courier,
+        stream: &Stream,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        stream.wait(&own.landed)?;
+        if how == Exchange::Keep {
+            return Ok(());
+        }
+        stream.wait(&peer.landed)?;
+        match how {
+            Exchange::Add => self.add(y, &own.inbox, len, stream)?,
+            _ => y.copy_from_device(0, &own.inbox, 0..len, stream)?,
+        }
+        own.taken.record(stream)
     }
 }
