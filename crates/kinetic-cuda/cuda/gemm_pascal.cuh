@@ -4,6 +4,18 @@
 
 #include "gemm.cuh"
 
+// The four int8 values of `word`, in order, as two f16 pairs, exactly:
+// 0x64XX is the f16 1024 + XX, so with each byte offset by 128 to make it
+// unsigned, one subtraction leaves the value. Full-rate integer and f16
+// instructions, where converting through f32 takes four quarter-rate ones.
+__device__ __forceinline__ void pgemm_int8_halves(unsigned word, __half2& lo, __half2& hi) {
+    const unsigned u = word ^ 0x80808080u;
+    const __half2 bias = __half2half2(__ushort_as_half(0x6480));  // 1152
+    const unsigned l = __byte_perm(u, 0x64646464u, 0x4140), h = __byte_perm(u, 0x64646464u, 0x4342);
+    lo = __hsub2(*reinterpret_cast<const __half2*>(&l), bias);
+    hi = __hsub2(*reinterpret_cast<const __half2*>(&h), bias);
+}
+
 // Quantized matrix products for GPUs without tensor cores (Pascal, Volta's
 // sm_70 build): Y = W X for batches larger than a GEMV's, in f32.
 //
@@ -150,18 +162,16 @@ struct PGemmInputs {
         for (unsigned c = 0; c < N; ++c) {
             const unsigned in = c * (PGEMM_THREADS / 4) + threadIdx.x / 4;
             const unsigned words[2] = {static_cast<unsigned>(q[c].x), static_cast<unsigned>(q[c].y)};
-            float v[8];
-#pragma unroll
-            for (unsigned i = 0; i < 8; ++i)
-                v[i] = static_cast<float>(static_cast<int8_t>(words[i / 4] >> (8 * (i % 4))));
             if constexpr (HALF) {
 #pragma unroll
-                for (unsigned i = 0; i < 4; ++i)
-                    sh.t.x[4 * part + i][in] = __floats2half2_rn(v[2 * i], v[2 * i + 1]);
+                for (unsigned i = 0; i < 2; ++i)
+                    pgemm_int8_halves(words[i], sh.t.x[4 * part + 2 * i][in], sh.t.x[4 * part + 2 * i + 1][in]);
                 if (part == 0) sh.t.d[in] = d[c];
             } else {
 #pragma unroll
-                for (unsigned i = 0; i < 8; ++i) sh.t.x[8 * part + i][in] = d[c] * v[i];
+                for (unsigned i = 0; i < 8; ++i)
+                    sh.t.x[8 * part + i][in] =
+                        d[c] * static_cast<float>(static_cast<int8_t>(words[i / 4] >> (8 * (i % 4))));
             }
         }
     }
@@ -190,30 +200,38 @@ __device__ __forceinline__ void pgemm_sub(float (&acc)[TR][TC], const S& sh, uns
     }
 }
 
-template <unsigned TR, unsigned TC, class S>
-__device__ __forceinline__ void pgemm_sub(float (&acc)[TR][TC], const S& sh, unsigned tr, unsigned tc,
-                                          std::true_type) {
-    __half2 h[TR][TC];
-#pragma unroll
-    for (unsigned i = 0; i < TR; ++i)
-#pragma unroll
-        for (unsigned j = 0; j < TC; ++j) h[i][j] = __float2half2_rn(0.0f);
-#pragma unroll 4
-    for (unsigned e = 0; e < 16; ++e) {
+// The f16 pair sums of one sub-block: h[i][j] gets the 16 products of row
+// pgemm_at(tr, i) and input pgemm_at(tc, j), added in k order from zero.
+// The first step adds its products to a constant zero, which costs nothing,
+// where zeroing the sums first takes a move each.
+template <unsigned TR, unsigned TC, unsigned WS, unsigned XS>
+__device__ __forceinline__ void pgemm_pairs(__half2 (&h)[TR][TC], const __half2 (&w)[16][WS],
+                                            const __half2 (&x)[16][XS], unsigned tr, unsigned tc) {
+    auto step = [&](unsigned e, bool first) {
         unsigned wu[TR], xu[TC];
 #pragma unroll
         for (unsigned g = 0; g < TR / 4; ++g)
-            *reinterpret_cast<uint4*>(&wu[4 * g]) = *reinterpret_cast<const uint4*>(&sh.t.w[e][pgemm_at(tr, 4 * g)]);
+            *reinterpret_cast<uint4*>(&wu[4 * g]) = *reinterpret_cast<const uint4*>(&w[e][pgemm_at(tr, 4 * g)]);
 #pragma unroll
         for (unsigned g = 0; g < TC / 4; ++g)
-            *reinterpret_cast<uint4*>(&xu[4 * g]) = *reinterpret_cast<const uint4*>(&sh.t.x[e][pgemm_at(tc, 4 * g)]);
+            *reinterpret_cast<uint4*>(&xu[4 * g]) = *reinterpret_cast<const uint4*>(&x[e][pgemm_at(tc, 4 * g)]);
 #pragma unroll
         for (unsigned i = 0; i < TR; ++i)
 #pragma unroll
             for (unsigned j = 0; j < TC; ++j)
-                h[i][j] = __hfma2(*reinterpret_cast<const __half2*>(&wu[i]),
-                                  *reinterpret_cast<const __half2*>(&xu[j]), h[i][j]);
-    }
+                h[i][j] = __hfma2(*reinterpret_cast<const __half2*>(&wu[i]), *reinterpret_cast<const __half2*>(&xu[j]),
+                                  first ? __float2half2_rn(0.0f) : h[i][j]);
+    };
+    step(0, true);
+#pragma unroll 5
+    for (unsigned e = 1; e < 16; ++e) step(e, false);
+}
+
+template <unsigned TR, unsigned TC, class S>
+__device__ __forceinline__ void pgemm_sub(float (&acc)[TR][TC], const S& sh, unsigned tr, unsigned tc,
+                                          std::true_type) {
+    __half2 h[TR][TC];
+    pgemm_pairs(h, sh.t.w, sh.t.x, tr, tc);
     float d[TC];
 #pragma unroll
     for (unsigned g = 0; g < TC / 4; ++g)
@@ -387,11 +405,8 @@ extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 2)
         if (loads_x) {
             const unsigned words[4] = {xr.x, xr.y, xr.z, xr.w};
 #pragma unroll
-            for (unsigned p = 0; p < 8; ++p) {
-                const unsigned word = words[p / 2] >> (16 * (p % 2));
-                b.x[8 * lp + p][lr] = __floats2half2_rn(static_cast<float>(static_cast<int8_t>(word)),
-                                                       static_cast<float>(static_cast<int8_t>(word >> 8)));
-            }
+            for (unsigned p = 0; p < 4; ++p)
+                pgemm_int8_halves(words[p], b.x[8 * lp + 2 * p][lr], b.x[8 * lp + 2 * p + 1][lr]);
             if (lp == 0) b.d[lr] = dr;
         }
     };
@@ -404,26 +419,7 @@ extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 2)
         if (s + 1 < subs) fetch(s + 1);
         const PF16Buf& b = sh[s % 2];
         __half2 h[PF16_TR][PF16_TC];
-#pragma unroll
-        for (unsigned i = 0; i < PF16_TR; ++i)
-#pragma unroll
-            for (unsigned j = 0; j < PF16_TC; ++j) h[i][j] = __float2half2_rn(0.0f);
-#pragma unroll 4
-        for (unsigned e = 0; e < 16; ++e) {
-            unsigned wu[PF16_TR], xu[PF16_TC];
-#pragma unroll
-            for (unsigned g = 0; g < PF16_TR / 4; ++g)
-                *reinterpret_cast<uint4*>(&wu[4 * g]) = *reinterpret_cast<const uint4*>(&b.w[e][pgemm_at(tr, 4 * g)]);
-#pragma unroll
-            for (unsigned g = 0; g < PF16_TC / 4; ++g)
-                *reinterpret_cast<uint4*>(&xu[4 * g]) = *reinterpret_cast<const uint4*>(&b.x[e][pgemm_at(tc, 4 * g)]);
-#pragma unroll
-            for (unsigned i = 0; i < PF16_TR; ++i)
-#pragma unroll
-                for (unsigned j = 0; j < PF16_TC; ++j)
-                    h[i][j] = __hfma2(*reinterpret_cast<const __half2*>(&wu[i]),
-                                      *reinterpret_cast<const __half2*>(&xu[j]), h[i][j]);
-        }
+        pgemm_pairs(h, b.w, b.x, tr, tc);
         float d[PF16_TC];
 #pragma unroll
         for (unsigned g = 0; g < PF16_TC / 4; ++g)
