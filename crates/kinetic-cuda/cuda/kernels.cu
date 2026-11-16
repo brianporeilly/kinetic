@@ -8,6 +8,7 @@
 #include "delta_chunk.cuh"
 #include "delta_net.cuh"
 #include "delta_scan.cuh"
+#include "delta_scan_f32.cuh"
 #include "embed.cuh"
 #include "exchange.cuh"
 #include "gemm.cuh"

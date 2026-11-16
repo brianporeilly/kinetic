@@ -21,6 +21,8 @@ const CHUNK: usize = 32;
 /// delta_scan.cuh.
 const SCAN_ROWS: usize = 32;
 const SCAN_THREADS: usize = 64;
+/// Threads of the f32 chunk scan; must match DSCAN32_THREADS.
+const SCAN_F32_THREADS: usize = 128;
 const RING_THREADS: usize = 256;
 
 /// The fixed shape of a gated delta-rule layer.
@@ -307,11 +309,12 @@ impl Kernels {
     /// norms, the recurrence as `flow` says, then the gated output norm into
     /// `io.out`.
     ///
-    /// Batches of more than [`MAX_BATCH`] tokens must commit. With tensor
-    /// cores and value heads of 128 they run the recurrence in chunks, as
-    /// accurate as f32 arithmetic but in another order, so their results
-    /// differ slightly from smaller batches; without, they run as steps of
-    /// [`MAX_BATCH`] tokens with the results of smaller batches.
+    /// Batches of more than [`MAX_BATCH`] tokens must commit. With value
+    /// heads of 128 they run the recurrence in chunks, on tensor cores as
+    /// accurate as f32 arithmetic, without them in f32, in another order
+    /// than steps, so their results differ slightly from smaller batches;
+    /// other heads run as steps of [`MAX_BATCH`] tokens with the results of
+    /// smaller batches.
     pub fn delta_net(
         &self,
         params: DeltaParams,
@@ -343,7 +346,8 @@ impl Kernels {
             )));
         }
         io.out.check_rows(n)?;
-        if n > MAX_BATCH && self.tensor_cores {
+        let chunked = self.tensor_cores || (flow == Flow::Commit && s.head_v_dim == HEAD_K_DIM);
+        if n > MAX_BATCH && chunked {
             return self.delta_batch(params, io, state, flow, batch, stream);
         }
         if n > MAX_BATCH && flow != Flow::Commit {
@@ -359,8 +363,9 @@ impl Kernels {
             )));
         }
 
-        // Larger batches (devices without tensor cores) commit a step of
-        // MAX_BATCH tokens at a time, each as a batch of its own.
+        // Larger batches of other heads (devices without tensor cores)
+        // commit a step of MAX_BATCH tokens at a time, each as a batch of
+        // its own.
         let (gated, f32s) = (io.out.act(), |at: usize, per: usize| 4 * (at * per) as u64);
         for at in (0..n).step_by(MAX_BATCH) {
             let m = (n - at).min(MAX_BATCH);
@@ -443,11 +448,6 @@ impl Kernels {
                 "{n} tokens of {s:?} in one pass need committed value heads of {HEAD_K_DIM}"
             )));
         }
-        if !self.tensor_cores {
-            return Err(Error::Shape(format!(
-                "{n} tokens in one pass need tensor cores; this device takes at most {MAX_BATCH}"
-            )));
-        }
 
         let mut args = DeltaArgs::new(&params, state, n, 0);
         args.batch = batch.device_ptr();
@@ -483,9 +483,13 @@ impl Kernels {
                 stream,
                 &args,
             )?;
+            let (scan, threads) = match self.tensor_cores {
+                true => (&self.delta_chunk_scan, SCAN_THREADS),
+                false => (&self.delta_chunk_scan_f32, SCAN_F32_THREADS),
+            };
             launch_struct(
-                &self.delta_chunk_scan,
-                config([s.n_v_heads, s.head_v_dim / SCAN_ROWS], SCAN_THREADS),
+                scan,
+                config([s.n_v_heads, s.head_v_dim / SCAN_ROWS], threads),
                 stream,
                 &args,
             )?;

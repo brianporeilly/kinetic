@@ -65,6 +65,7 @@ pub struct Kernels {
     pub(crate) delta_ring_store: Function,
     pub(crate) delta_chunk_prep: Function,
     pub(crate) delta_chunk_scan: Function,
+    pub(crate) delta_chunk_scan_f32: Function,
     pub(crate) delta_rule: Function,
     pub(crate) delta_gated_norm: Function,
     pub(crate) short_conv_q8: Function,
@@ -188,6 +189,7 @@ impl Kernels {
             delta_ring_store: module.function(c"delta_ring_store")?,
             delta_chunk_prep: module.function(c"delta_chunk_prep")?,
             delta_chunk_scan: module.function(c"delta_chunk_scan")?,
+            delta_chunk_scan_f32: module.function(c"delta_chunk_scan_f32")?,
             delta_rule: module.function(c"delta_rule")?,
             delta_gated_norm: module.function(c"delta_gated_norm")?,
             short_conv_q8: module.function(c"short_conv_q8")?,
@@ -215,8 +217,8 @@ impl Kernels {
     /// Whether batches of more than [`MAX_BATCH`] tokens can run in one pass;
     /// without, they must go in steps of at most that many. Devices without
     /// tensor cores run them with f32 products and attention, attention to
-    /// heads of 64 in steps of [`MAX_BATCH`] tokens and the delta rule token
-    /// by token.
+    /// heads of 64 in steps of [`MAX_BATCH`] tokens, and the delta rule in
+    /// chunks on the CUDA cores.
     pub fn large_batches(&self) -> bool {
         self.attn_flash.is_some() || !self.tensor_cores
     }
