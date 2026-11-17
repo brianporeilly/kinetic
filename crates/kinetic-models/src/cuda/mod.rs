@@ -875,8 +875,11 @@ impl<'m> CudaModel<'m> {
             s.reset()?;
         }
         let mut done = 0;
-        let chunks: Vec<&[u32]> =
-            batches(tokens, state.pos, since.is_none(), self.batch_rows()).collect();
+        let paired = self.overlap.is_some() && since.is_none() && !all_rows;
+        let chunks: Vec<&[u32]> = match paired {
+            true => paired_batches(tokens, state.pos, self.batch_rows()),
+            false => batches(tokens, state.pos, since.is_none(), self.batch_rows()).collect(),
+        };
         let mut at = 0;
         while at < chunks.len() {
             // Two passes that read no logits run at once where they can.
@@ -1478,15 +1481,68 @@ fn batch_rows(kernels: &Kernels, context: usize) -> usize {
 /// [`PREFILL_GRID`] that are too few for a batch of their own go in steps
 /// too, as a run of only them would take them.
 fn batches(tokens: &[u32], pos: usize, prefill: bool, rows: usize) -> impl Iterator<Item = &[u32]> {
+    let (head, tail) = tokens.split_at(prefill_len(tokens, pos, prefill));
+    head.chunks(rows).chain(tail.chunks(MAX_BATCH))
+}
+
+/// How many of `tokens`, after `pos` others, [`batches`] runs as prefill.
+fn prefill_len(tokens: &[u32], pos: usize, prefill: bool) -> usize {
     let tail = (pos + tokens.len() - 1) % PREFILL_GRID + 1;
-    let head = match prefill && tokens.len() >= PREFILL_FROM {
+    match prefill && tokens.len() >= PREFILL_FROM {
         true if tail < PREFILL_FROM => tokens.len() - tail,
         true => tokens.len(),
         false => 0,
-    };
-    let (head, tail) = tokens.split_at(head);
-    head.chunks(rows).chain(tail.chunks(MAX_BATCH))
+    }
 }
+
+/// [`batches`] for a model that runs two passes at once, which it can for
+/// every pass but the last: a pass alone runs at about two thirds of the
+/// rate of two together, on two P100s. So when the prefill part ends the
+/// run, its last batch is only the last [`PREFILL_GRID`] or less, and the
+/// rest goes in pairs of near-equal batches of at most `rows`, cut on the
+/// grid. Batches below [`PAIRED_FROM`], and full pairs with less than
+/// that over, stay as [`batches`] cuts them.
+/// Results do not change, as they do not depend on where the grid cuts a
+/// prompt.
+fn paired_batches(tokens: &[u32], pos: usize, rows: usize) -> Vec<&[u32]> {
+    let len = prefill_len(tokens, pos, true);
+    if len < 2 * PAIRED_FROM {
+        return batches(tokens, pos, true, rows).collect();
+    }
+    // cuts at absolute multiples of the grid
+    let first = (pos.next_multiple_of(PREFILL_GRID) - pos).min(len);
+    let end = (pos + len) / PREFILL_GRID * PREFILL_GRID - pos;
+    let paired = match len < tokens.len() {
+        true => end,
+        // a last batch of at most the grid, read for the logits
+        false => (pos + len - 1) / PREFILL_GRID * PREFILL_GRID - pos,
+    };
+    // full pairs with little over run faster as they are than as more,
+    // smaller pairs
+    let over = paired.saturating_sub(first) % (2 * rows);
+    if paired >= 2 * rows && over < PAIRED_FROM {
+        return batches(tokens, pos, true, rows).collect();
+    }
+    let units = paired.saturating_sub(first) / PREFILL_GRID;
+    let count = 2 * paired.div_ceil(2 * rows);
+    let cut = |k: usize| match k {
+        0 => 0,
+        k => first + (k * (units / count) + k.min(units % count)) * PREFILL_GRID,
+    };
+    if units < count || (0..count).any(|k| !(PAIRED_FROM..=rows).contains(&(cut(k + 1) - cut(k)))) {
+        return batches(tokens, pos, true, rows).collect();
+    }
+    let mut out: Vec<&[u32]> = (0..count).map(|k| &tokens[cut(k)..cut(k + 1)]).collect();
+    if cut(count) < len {
+        out.push(&tokens[cut(count)..len]);
+    }
+    out.extend(tokens[len..].chunks(MAX_BATCH));
+    out
+}
+
+/// Fewest tokens in a batch [`paired_batches`] cuts: two passes of fewer
+/// measured slower together than as one.
+const PAIRED_FROM: usize = 256;
 
 /// `rows` in runs of at most [`MAX_BATCH`].
 fn slices(rows: Range<usize>) -> impl Iterator<Item = Range<usize>> {
@@ -1519,4 +1575,51 @@ fn routed_experts<'m>(model: &Model<'m>) -> Result<Option<Vec<Moe<'m>>>, LoadErr
 
 fn shape(msg: String) -> kinetic_cuda::Error {
     kinetic_cuda::Error::Shape(msg)
+}
+
+#[cfg(test)]
+mod paired_tests {
+    use super::*;
+
+    #[test]
+    fn paired_batches_cover_the_prompt_on_the_grid_in_pairs() {
+        let tokens: Vec<u32> = (0..9000).collect();
+        for pos in [0, 5, 32, 1000] {
+            for len in [
+                1, 20, 40, 100, 502, 1024, 1044, 1536, 1564, 2048, 2080, 2085, 3126, 4160, 4168,
+                8192,
+            ] {
+                let t = &tokens[..len];
+                let got = paired_batches(t, pos, 1024);
+                assert_eq!(got.concat(), t, "pos {pos} len {len}");
+                let plain: Vec<&[u32]> = batches(t, pos, true, 1024).collect();
+                let prefill = prefill_len(t, pos, true);
+                let mut at = pos;
+                let mut big = 0;
+                for b in &got {
+                    assert!(b.len() <= 1024, "pos {pos} len {len}");
+                    if at - pos < prefill && got != plain {
+                        big += 1;
+                        let end = at + b.len();
+                        assert!(
+                            end % PREFILL_GRID == 0 || end == pos + prefill,
+                            "pos {pos} len {len}"
+                        );
+                    }
+                    at += b.len();
+                }
+                // cut anew only into pairs and, ending the run, a last
+                // batch within the grid
+                if got != plain {
+                    let steps_follow = prefill < len;
+                    let lone = usize::from(!steps_follow);
+                    assert!(big >= 2 + lone, "pos {pos} len {len}");
+                    assert_eq!(big % 2, lone, "pos {pos} len {len}");
+                    if !steps_follow {
+                        assert!(got[big - 1].len() <= PREFILL_GRID, "pos {pos} len {len}");
+                    }
+                }
+            }
+        }
+    }
 }
