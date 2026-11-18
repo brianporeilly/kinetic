@@ -227,6 +227,12 @@ __device__ __forceinline__ void pgemm_pairs(__half2 (&h)[TR][TC], const __half2 
     for (unsigned e = 1; e < 16; ++e) step(e, false);
 }
 
+// `acc` plus a sub-block's sum in f16 pairs times the input's scale `d`:
+// the two halves add in f16, one instruction, and the sum once in f32.
+__device__ __forceinline__ float pgemm_settle(float acc, __half2 h, float d) {
+    return fmaf(d, __low2float(__hadd2(h, __lowhigh2highlow(h))), acc);
+}
+
 template <unsigned TR, unsigned TC, class S>
 __device__ __forceinline__ void pgemm_sub(float (&acc)[TR][TC], const S& sh, unsigned tr, unsigned tc,
                                           std::true_type) {
@@ -240,8 +246,7 @@ __device__ __forceinline__ void pgemm_sub(float (&acc)[TR][TC], const S& sh, uns
     for (unsigned i = 0; i < TR; ++i)
 #pragma unroll
         for (unsigned j = 0; j < TC; ++j) {
-            const float2 f = __half22float2(h[i][j]);
-            acc[i][j] = fmaf(d[j], f.x + f.y, acc[i][j]);
+            acc[i][j] = pgemm_settle(acc[i][j], h[i][j], d[j]);
         }
 }
 
@@ -430,8 +435,7 @@ extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 2)
         for (unsigned i = 0; i < PF16_TR; ++i)
 #pragma unroll
             for (unsigned j = 0; j < PF16_TC; ++j) {
-                const float2 f = __half22float2(h[i][j]);
-                acc[i][j] = fmaf(d[j], f.x + f.y, acc[i][j]);
+                acc[i][j] = pgemm_settle(acc[i][j], h[i][j], d[j]);
             }
         // the other buffer was last read before the previous barrier
         if (s + 1 < subs) put(sh[(s + 1) % 2]);
