@@ -87,4 +87,15 @@ pub trait Backend: Send {
     fn run_ahead(&mut self, _prompt: &[u32]) -> usize {
         0
     }
+
+    /// Whether the last request left work that the next one to continue
+    /// its sequence would otherwise run first; see [`Backend::settle_some`].
+    fn unsettled(&self) -> bool {
+        false
+    }
+
+    /// Runs a short piece of the work [`Backend::unsettled`] tells of, so
+    /// that a request that comes while the backend is idle need not wait
+    /// for it all. What a request generates is the same either way.
+    fn settle_some(&mut self) {}
 }

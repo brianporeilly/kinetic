@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use kinetic_gguf::Gguf;
 use kinetic_grammar::{Grammar, Vocabulary};
@@ -35,6 +36,10 @@ const END_OF_TURN: &[&str] = &[
 
 /// Stands in for the rest of a message being written, to find where it
 /// goes in the rendered template.
+/// How long the backends sit idle before [`Engine::settle_while_idle`]
+/// settles them.
+const SETTLE_AFTER: Duration = Duration::from_millis(250);
+
 const DRAFT_END: &str = "\u{F8FF}";
 
 /// The token chat templates write where an image goes, and the tokens the
@@ -328,14 +333,24 @@ impl<'a> Engine<'a> {
 
     fn on_free<T>(
         &self,
-        mut free: MutexGuard<'_, Vec<(usize, Box<dyn Backend + 'a>)>>,
+        free: MutexGuard<'_, Vec<(usize, Box<dyn Backend + 'a>)>>,
         prompt: &[u32],
         f: impl FnOnce(usize, &mut dyn Backend) -> T,
     ) -> T {
         let best = (0..free.len())
             .max_by_key(|&i| free[i].1.reuses(prompt))
             .expect("a free backend");
-        let backend = free.swap_remove(best);
+        self.on_free_at(free, best, f)
+    }
+
+    /// Runs `f` on free backend `i` of `free`.
+    fn on_free_at<T>(
+        &self,
+        mut free: MutexGuard<'_, Vec<(usize, Box<dyn Backend + 'a>)>>,
+        i: usize,
+        f: impl FnOnce(usize, &mut dyn Backend) -> T,
+    ) -> T {
+        let backend = free.swap_remove(i);
         drop(free);
         // Returns the backend even when `f` panics, as a lost client does
         // not take a slot with it.
@@ -350,6 +365,48 @@ impl<'a> Engine<'a> {
         let mut back = Back(self, Some(backend));
         let (id, backend) = back.1.as_mut().expect("the backend");
         f(*id, backend.as_mut())
+    }
+
+    /// Settles idle backends until `live` turns false: once the backends
+    /// have sat idle for [`SETTLE_AFTER`], each that [`Backend::unsettled`]
+    /// runs [`Backend::settle_some`] in turn while no request waits for a
+    /// backend. A request that comes straight after a response, as a
+    /// client's next one in a loop does, finds things as without this.
+    pub fn settle_while_idle(&self, live: impl Fn() -> bool) {
+        let mut free = self.lock_free();
+        while live() {
+            if !free.iter().any(|(_, b)| b.unsettled()) {
+                free = self
+                    .freed
+                    .wait(free)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            // a backend taken or given back meanwhile starts the wait over
+            let (again, wait) = self
+                .freed
+                .wait_timeout(free, SETTLE_AFTER)
+                .unwrap_or_else(PoisonError::into_inner);
+            free = again;
+            if !wait.timed_out() {
+                continue;
+            }
+            while live() && self.waiting.load(Ordering::SeqCst) == 0 {
+                let Some(i) = free.iter().position(|(_, b)| b.unsettled()) else {
+                    break;
+                };
+                self.on_free_at(free, i, |_, b| b.settle_some());
+                free = self.lock_free();
+            }
+        }
+    }
+
+    /// Wakes [`Engine::settle_while_idle`] to look at `live` again.
+    pub fn wake(&self) {
+        // under the lock, so the wakeup cannot fall between its look at
+        // `live` and its wait
+        let _free = self.lock_free();
+        self.freed.notify_all();
     }
 
     /// Lets prompts carry images, which `encoder` turns into rows of the

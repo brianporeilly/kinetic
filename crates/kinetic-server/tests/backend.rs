@@ -286,7 +286,9 @@ fn rem(a: i32, b: i32) -> i32 {",
     }
 
     /// Every turn of a chat continued from the cache gives what the whole
-    /// conversation gives run cold.
+    /// conversation gives run cold, whether the next turn settles the
+    /// reply before it, or the backend settles it between turns, whole or
+    /// a piece of it.
     #[test]
     #[ignore = "needs KINETIC_TEST_GGUF and a CUDA device"]
     fn gpu_chat_continues_like_a_cold_run() {
@@ -332,14 +334,23 @@ fn f{i}(a: i32) -> i32 {{"
         drop(gpu);
 
         let mut backend = CudaBackend::new(&model, 4096).unwrap();
-        for (sampling, chat) in &chats {
-            for (turn, (prompt, answer)) in chat.iter().enumerate() {
-                assert!(turn == 0 || backend.reuses(prompt) > 0, "turn {turn}");
-                assert_eq!(
-                    &generate(&mut backend, prompt, sampling),
-                    answer,
-                    "turn {turn}, {sampling:?}"
-                );
+        for pieces in [0, 1, usize::MAX] {
+            for (sampling, chat) in &chats {
+                for (turn, (prompt, answer)) in chat.iter().enumerate() {
+                    assert!(turn == 0 || backend.reuses(prompt) > 0, "turn {turn}");
+                    assert_eq!(
+                        &generate(&mut backend, prompt, sampling),
+                        answer,
+                        "turn {turn}, {sampling:?}, {pieces} pieces settled"
+                    );
+                    assert!(backend.unsettled());
+                    for _ in 0..pieces {
+                        if !backend.unsettled() {
+                            break;
+                        }
+                        backend.settle_some();
+                    }
+                }
             }
         }
     }
