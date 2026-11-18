@@ -138,7 +138,13 @@ fn check_attention(shape: AttentionShape) {
     let f16 = [KvType::F16; 2];
     let steps = attention_outputs(&gpu, shape, f16, false, false);
     let batched = attention_outputs(&gpu, shape, f16, true, false);
-    assert_close(&format!("attention {shape:?}"), &batched, &steps, 1e-5);
+    // the P100's tile adds its terms in f16 pairs, the products' rounding
+    let tol = if gpu.kernels.half_products() {
+        3e-3
+    } else {
+        1e-5
+    };
+    assert_close(&format!("attention {shape:?}"), &batched, &steps, tol);
 }
 
 /// A batch handed to another device keeps the positions of every step, so

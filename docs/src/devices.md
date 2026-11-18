@@ -82,7 +82,9 @@ inputs in pairs of f16 values and apply the scales in f32, about 1.5 times
 as fast; their results differ from the f32 products in the last bits, as a
 different order of summation would. Batches of 256 tokens or more expand
 each matrix to f16 once and multiply that, faster again, with the same
-results. The Tesla P100 (6.0) also lacks the int8 dot product instruction,
+results. The P100's attention tiles take queries, keys, weights and
+values in f16 pairs too, adding each run of terms in f32, which rounds them
+to about one part in a thousand. The Tesla P100 (6.0) also lacks the int8 dot product instruction,
 which its kernels do in plain integer arithmetic, with the same results and
 less speed. The release binaries and `Dockerfile.cuda` build with CUDA 12
 and have kernels for them; a build from source with CUDA 13 does not, see
