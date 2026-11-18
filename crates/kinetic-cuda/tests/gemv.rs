@@ -191,8 +191,9 @@ fn large_batches_match_reference() {
 }
 
 /// Without tensor cores, in f16 pairs, a batch of 256 inputs or more expands
-/// its weights to f16 once and multiplies those; its outputs must have the
-/// bits of smaller batches, which expand the weights in every tile.
+/// its weights to f16 once and multiplies those, in pieces of the rows where
+/// the buffer is short; its outputs must have the bits of smaller batches,
+/// which expand the weights in every tile.
 #[test]
 fn unpacked_products_keep_the_bits() {
     let Some(gpu) = gpu() else { return };
@@ -225,6 +226,14 @@ fn unpacked_products_keep_the_bits() {
         assert!(
             bits(&whole) == bits(&parts),
             "{ty}: a large batch changes bits"
+        );
+        // room for 128 rows, as when memory is short: pieces of 128 and 72
+        gpu.kernels.limit_unpacked(128 * cols);
+        let pieces = run(0..n);
+        gpu.kernels.limit_unpacked(usize::MAX);
+        assert!(
+            bits(&pieces) == bits(&parts),
+            "{ty}: pieces of the rows change bits"
         );
     }
 }

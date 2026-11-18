@@ -34,9 +34,12 @@ pub struct Kernels {
     pub(crate) gemm: Vec<Vec<Function>>,
     /// Without tensor cores: the product of weights expanded to f16 by the
     /// `unpack` kernels in `gemm`, and the f16 weights of each stream that
-    /// has used it, grown as needed; see [`Kernels::gemm`].
+    /// has used it, grown as needed and as memory allows; see
+    /// [`Kernels::gemm`].
     pub(crate) pgemm_f16w: Option<Function>,
-    pub(crate) unpacked: std::cell::RefCell<Vec<(usize, DeviceBuffer<u16>)>>,
+    pub(crate) unpacked: std::cell::RefCell<Vec<crate::gemm::Unpacked>>,
+    /// Most values a stream's expanded weights may take; tests lower it.
+    pub(crate) unpack_limit: std::cell::Cell<usize>,
     pub(crate) quantize_q8: Function,
     pub(crate) fold_rows: Function,
     pub(crate) unfold_rows: Function,
@@ -162,6 +165,7 @@ impl Kernels {
                 .then(|| module.function(c"pgemm_f16w"))
                 .transpose()?,
             unpacked: std::cell::RefCell::new(Vec::new()),
+            unpack_limit: std::cell::Cell::new(usize::MAX),
             quantize_q8: module.function(c"quantize_q8")?,
             fold_rows: module.function(c"fold_rows")?,
             unfold_rows: module.function(c"unfold_rows")?,
@@ -230,6 +234,14 @@ impl Kernels {
     /// to f32 rounding.
     pub fn half_products(&self) -> bool {
         self.half
+    }
+
+    /// Caps each stream's weights expanded to f16 at `values`, as when
+    /// memory is short, and drops those expanded so far; for tests.
+    #[doc(hidden)]
+    pub fn limit_unpacked(&self, values: usize) {
+        self.unpack_limit.set(values);
+        self.unpacked.borrow_mut().clear();
     }
 
     /// Reads all of `data` once and adds its sum as 32-bit words to `out[0]`.

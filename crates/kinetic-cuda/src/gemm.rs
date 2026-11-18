@@ -343,11 +343,12 @@ impl Kernels {
         ]
     }
 
-    /// Queues `y = w[..rows] x[inputs]` in f16 pairs as two launches: the
-    /// rows expanded to f16, into this stream's buffer of them, then the
-    /// product of those, with the bits of the product in one launch. Returns
-    /// `false`, queuing nothing, where the type has no such kernels or the
-    /// buffer cannot grow.
+    /// Queues `y = w[..rows] x[inputs]` in f16 pairs as two launches per
+    /// piece of the rows: the rows expanded to f16, into this stream's
+    /// buffer of them, then the product of those, with the bits of the
+    /// product in one launch. The pieces are as many rows as the buffer
+    /// holds, all of them unless memory is short. Returns `false`, queuing
+    /// nothing, where the type has no such kernels or no buffer fits.
     fn gemm_unpacked(
         &self,
         w: &DeviceMatrix,
@@ -363,75 +364,82 @@ impl Kernels {
         ) else {
             return Ok(false);
         };
-        let len = rows * w.cols();
-        let key = stream.raw() as usize;
+        let cols = w.cols();
         let mut unpacked = self.unpacked.borrow_mut();
-        let found = unpacked.iter().position(|(k, _)| *k == key);
-        let at = match found {
-            Some(at) if unpacked[at].1.len() >= len => at,
-            _ => {
-                // perf: a model that fits only without this buffer keeps to
-                // the kernel that expands its weights in every tile
-                let Ok(grown) = DeviceBuffer::new(stream.context(), len) else {
-                    return Ok(false);
-                };
-                match found {
-                    Some(at) => {
-                        unpacked[at].1 = grown;
-                        at
-                    }
-                    None => {
-                        unpacked.push((key, grown));
-                        unpacked.len() - 1
-                    }
-                }
+        let key = stream.raw() as usize;
+        let at = match unpacked.iter().position(|u| u.stream == key) {
+            Some(at) => at,
+            None => {
+                unpacked.push(Unpacked {
+                    stream: key,
+                    buf: None,
+                    tried: 0,
+                });
+                unpacked.len() - 1
             }
         };
-        let buf = &unpacked[at].1;
-        let (wp, out) = (w.data().device_ptr(), buf.device_ptr());
-        let (r, cols, total) = (rows as u32, w.cols() as u32, w.total_blocks());
-        let config = LaunchConfig::linear(r.div_ceil(PUNPACK_ROWS), 256);
-        // SAFETY: matches `p<format>_unpack(const uint8_t*, __half*,
-        // unsigned, unsigned, size_t)`; `w` holds at least `rows` rows of
-        // `cols`, a multiple of the stage, and the buffer `rows * cols`
-        // values.
-        unsafe {
-            unpack.launch(
-                config,
-                stream,
-                &mut [arg(&wp), arg(&out), arg(&r), arg(&cols), arg(&total)],
-            )?;
+        let u = &mut unpacked[at];
+        let want = (rows * cols).min(self.unpack_limit.get());
+        if want > u.tried {
+            u.tried = want;
+            u.grow(stream, want, PF16_ROWS as usize * cols);
         }
-        let first = inputs.start * x.width();
-        let (xp, dp) = (
-            x.quantized().ptr_at(first),
-            x.block_scales().ptr_at(first / 16),
-        );
-        let (yp, n) = (y.device_ptr(), inputs.len() as u32);
-        let config = LaunchConfig {
-            grid: [n.div_ceil(PF16_COLS), r.div_ceil(PF16_ROWS), 1],
-            block: [256, 1, 1],
-            shared_bytes: 0,
+        let Some(buf) = &u.buf else {
+            // perf: a model that fits only without this buffer keeps to the
+            // kernel that expands its weights in every tile
+            return Ok(false);
         };
-        // SAFETY: matches `pgemm_f16w(const __half*, const int8_t*, const
-        // float2*, float*, unsigned, unsigned, unsigned)`; the buffer holds
-        // `rows` rows of `cols` values, `x` the inputs, as the caller
-        // checked, and `y` their `n * rows` outputs.
-        unsafe {
-            product.launch(
-                config,
-                stream,
-                &mut [
-                    arg(&out),
-                    arg(&xp),
-                    arg(&dp),
-                    arg(&yp),
-                    arg(&r),
-                    arg(&cols),
-                    arg(&n),
-                ],
-            )
-        }?;
+        let piece = buf.len() / cols / PF16_ROWS as usize * PF16_ROWS as usize;
+        if piece == 0 {
+            return Ok(false);
+        }
+        let (wp, out) = (w.data().device_ptr(), buf.device_ptr());
+        let (c, total, stride) = (cols as u32, w.total_blocks(), rows as u32);
+        let at = inputs.start * x.width();
+        let (xp, dp) = (x.quantized().ptr_at(at), x.block_scales().ptr_at(at / 16));
+        let n = inputs.len() as u32;
+        for first in (0..rows).step_by(piece) {
+            let (f, r) = (first as u32, piece.min(rows - first) as u32);
+            let config = LaunchConfig::linear(r.div_ceil(PUNPACK_ROWS), 256);
+            // SAFETY: matches `p<format>_unpack(const uint8_t*, __half*,
+            // unsigned, unsigned, unsigned, size_t)`; `w` holds rows `first`
+            // to `first + r` of `cols`, a multiple of the stage, and the
+            // buffer `r * cols` values.
+            unsafe {
+                unpack.launch(
+                    config,
+                    stream,
+                    &mut [arg(&wp), arg(&out), arg(&f), arg(&r), arg(&c), arg(&total)],
+                )?;
+            }
+            let yp = y.device_ptr() + 4 * first as u64;
+            let config = LaunchConfig {
+                grid: [n.div_ceil(PF16_COLS), r.div_ceil(PF16_ROWS), 1],
+                block: [256, 1, 1],
+                shared_bytes: 0,
+            };
+            // SAFETY: matches `pgemm_f16w(const __half*, const int8_t*, const
+            // float2*, float*, unsigned, unsigned, unsigned, unsigned)`; the
+            // buffer holds `r` rows of `cols` values, `x` the inputs, as the
+            // caller checked, and `y` their `n * rows` outputs, of which the
+            // piece writes rows `first` to `first + r`.
+            unsafe {
+                product.launch(
+                    config,
+                    stream,
+                    &mut [
+                        arg(&out),
+                        arg(&xp),
+                        arg(&dp),
+                        arg(&yp),
+                        arg(&r),
+                        arg(&c),
+                        arg(&n),
+                        arg(&stride),
+                    ],
+                )
+            }?;
+        }
         Ok(true)
     }
 
@@ -501,6 +509,31 @@ impl Kernels {
             2
         } else {
             1
+        }
+    }
+}
+
+/// A stream's buffer of weights expanded to f16, and the most values it has
+/// tried to hold, so that a size that did not fit is not tried again.
+pub(crate) struct Unpacked {
+    stream: usize,
+    buf: Option<DeviceBuffer<u16>>,
+    tried: usize,
+}
+
+impl Unpacked {
+    /// Grows the buffer to `want` values or, where that does not fit, to
+    /// the most of halves of it down to `least`, keeping a buffer at least
+    /// as large as the one it has.
+    fn grow(&mut self, stream: &Stream, want: usize, least: usize) {
+        let have = self.buf.as_ref().map_or(0, |b| b.len());
+        let mut len = want;
+        while len > have && len >= least {
+            if let Ok(buf) = DeviceBuffer::new(stream.context(), len) {
+                self.buf = Some(buf);
+                return;
+            }
+            len /= 2;
         }
     }
 }

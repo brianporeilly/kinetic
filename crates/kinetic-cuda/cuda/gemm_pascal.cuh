@@ -304,20 +304,21 @@ __device__ __forceinline__ void pgemm(const uint8_t* w, Q8Input x, float* y, uns
 // Wide tiles: 8 by 8 in f16 pairs, 8 by 4 in f32.
 constexpr unsigned PGEMM_WIDE_TC = PGEMM_HALF ? 8 : 4;
 
-// Rows `rows` of `w` expanded to f16 into `out`, row-major, each row `cols`
-// values: the f16 weights pgemm_expand writes to shared memory, from the
-// same decoders and arithmetic, for pgemm_f16w. grid ceil(rows / 64),
-// block PGEMM_THREADS; `cols` is a multiple of GEMM_K.
+// Rows `first` to `first + rows` of `w` expanded to f16 into `out`,
+// row-major, each row `cols` values: the f16 weights pgemm_expand writes
+// to shared memory, from the same decoders and arithmetic, for pgemm_f16w.
+// grid ceil(rows / 64), block PGEMM_THREADS; `cols` is a multiple of
+// GEMM_K.
 constexpr unsigned PUNPACK_ROWS = PGEMM_THREADS / GEMM_PARTS;
 
 template <class F>
-__device__ __forceinline__ void pgemm_unpack(const uint8_t* w, __half* out, unsigned rows,
-                                             unsigned cols, size_t total) {
+__device__ __forceinline__ void pgemm_unpack(const uint8_t* w, __half* out, unsigned first,
+                                             unsigned rows, unsigned cols, size_t total) {
     __shared__ PGemmStage<PUNPACK_ROWS> st;
     const unsigned row0 = blockIdx.x * PUNPACK_ROWS, stages = cols / GEMM_K;
     // decoding: thread (own, u) reads part u of row own
     const unsigned own = threadIdx.x / GEMM_PARTS, u = threadIdx.x % GEMM_PARTS;
-    const size_t blk = static_cast<size_t>(min(row0 + own, rows - 1)) * (cols / F::BLOCK);
+    const size_t blk = static_cast<size_t>(first + min(row0 + own, rows - 1)) * (cols / F::BLOCK);
     // expanding, as pgemm_expand: thread t takes elements 8 (t % 4) .. + 7
     // of each sub-block of row t / 4
     const unsigned row = threadIdx.x / 4, part = threadIdx.x % 4;
@@ -361,8 +362,9 @@ __device__ __forceinline__ void pgemm_unpack(const uint8_t* w, __half* out, unsi
 // reads the next one's weights and inputs from global memory while the
 // block multiplies this one, with one barrier per sub-block. A block of
 // 256 threads takes 128 rows by 64 inputs, each thread 8 rows by 4 inputs
-// in groups of four 64 apart, as pgemm_at. grid (ceil(n / 64),
-// ceil(rows / 128)).
+// in groups of four 64 apart, as pgemm_at. Output row r of input i goes to
+// y[i * stride + r], so pieces of a matrix's rows fill one output. grid
+// (ceil(n / 64), ceil(rows / 128)).
 constexpr unsigned PF16_TR = 8, PF16_TC = 4;
 constexpr unsigned PF16_ROWS = 16 * PF16_TR, PF16_COLS = 16 * PF16_TC;
 
@@ -374,7 +376,7 @@ struct __align__(16) PF16Buf {
 
 extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 2)
     pgemm_f16w(const __half* w, const int8_t* xq, const float2* xds, float* y, unsigned rows,
-               unsigned cols, unsigned n) {
+               unsigned cols, unsigned n, unsigned stride) {
     __shared__ PF16Buf sh[2];
     const unsigned t = threadIdx.x, row0 = blockIdx.y * PF16_ROWS, in0 = blockIdx.x * PF16_COLS;
     const unsigned subs = cols / 32;
@@ -440,7 +442,7 @@ extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 2)
 #pragma unroll
         for (unsigned j = 0; j < PF16_TC; ++j) {
             const unsigned row = row0 + pgemm_at(tr, i), in = in0 + pgemm_at(tc, j);
-            if (row < rows && in < n) y[static_cast<size_t>(in) * rows + row] = acc[i][j];
+            if (row < rows && in < n) y[static_cast<size_t>(in) * stride + row] = acc[i][j];
         }
 }
 
@@ -462,8 +464,9 @@ extern "C" __global__ void __launch_bounds__(PGEMM_THREADS, 2)
         pgemm<F, 8, PGEMM_WIDE_TC>(w, Q8Input{xq, xds}, y, rows, cols, total, n);               \
     }                                                                                           \
     extern "C" __global__ void __launch_bounds__(PGEMM_THREADS)                                 \
-        name##_unpack(const uint8_t* w, __half* out, unsigned rows, unsigned cols, size_t total) { \
-        pgemm_unpack<F>(w, out, rows, cols, total);                                             \
+        name##_unpack(const uint8_t* w, __half* out, unsigned first, unsigned rows, unsigned cols, \
+                      size_t total) {                                                           \
+        pgemm_unpack<F>(w, out, first, rows, cols, total);                                      \
     }
 
 PGEMM_KERNEL(pgemm_q4_k, GemmK4<false>)
