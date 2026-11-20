@@ -52,6 +52,10 @@ pub struct Features {
     pub storage_8bit: bool,
     /// Cooperative matrix operations (`VK_KHR_cooperative_matrix`).
     pub cooperative_matrix: bool,
+    /// What the f16 matrix kernels for prompt passes need: cooperative
+    /// 16x16x16 f16 products into f32 in a subgroup, f16 arithmetic, 16-bit
+    /// storage and the Vulkan memory model.
+    pub matrix_f16: bool,
     /// Descriptors pushed straight into command buffers (`VK_KHR_push_descriptor`).
     pub push_descriptor: bool,
     /// The compute queue can write timestamps.

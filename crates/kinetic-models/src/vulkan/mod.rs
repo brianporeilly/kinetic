@@ -54,22 +54,6 @@ pub const MAX_BATCH: usize = 16;
 /// decoded with are the faster ones.
 const PROMPT_MIN: usize = 4;
 
-/// Most tokens a prompt pass runs: what the driver asks for, or
-/// [`MAX_BATCH`] if it has no kernels of its own for such passes. They
-/// give every token the bits it gets alone, so nothing but speed depends
-/// on how a prompt is split.
-const PROMPT_BATCH: usize = larger(kinetic_vulkan::PROMPT_BATCH, MAX_BATCH);
-
-// Not `max`: clippy refuses to compare the 0 of a driver without a prompt
-// kernel as a constant.
-const fn larger(a: usize, b: usize) -> usize {
-    if a > b {
-        a
-    } else {
-        b
-    }
-}
-
 /// The device and its kernels.
 struct Gpu {
     device: Rc<Device>,
@@ -127,6 +111,9 @@ pub struct VulkanModel<'m> {
     layers: Vec<VulkanLayer>,
     mtp: Option<VulkanMtp>,
     ropes: RopeTables,
+    /// Most tokens a prompt pass runs: what the device's kernels ask for,
+    /// or [`MAX_BATCH`] if it has none of its own for such passes.
+    prompt_batch: usize,
 }
 
 /// A sequence's caches and buffers on the device.
@@ -215,7 +202,8 @@ impl<'m> VulkanModel<'m> {
             kernels: Kernels::load(&device).map_err(vulkan_error)?,
             device,
         };
-        let mut ropes = RopeTables::new(PROMPT_BATCH);
+        let prompt_batch = gpu.kernels.prompt_batch().max(MAX_BATCH);
+        let mut ropes = RopeTables::new(prompt_batch);
         let layers = model
             .layers
             .iter()
@@ -239,6 +227,7 @@ impl<'m> VulkanModel<'m> {
             output_norm: gpu.vector(&model.output_norm)?,
             layers,
             ropes,
+            prompt_batch,
             gpu,
         })
     }
@@ -271,16 +260,16 @@ impl<'m> VulkanModel<'m> {
             Work::new(&self.gpu, &self.layers, self.n_embd, batch, self.n_vocab())
         };
         // A prompt pass wants the logits of its last token at most.
-        let many = PROMPT_BATCH > MAX_BATCH;
+        let many = self.prompt_batch > MAX_BATCH;
         let prompt_work = match many {
-            true => Some(work(PROMPT_BATCH, 1)?),
+            true => Some(work(self.prompt_batch, 1)?),
             false => None,
         };
         let work = work(MAX_BATCH, MAX_BATCH)?;
         let layers = self
             .layers
             .iter()
-            .map(|l| l.new_state(dev, self.context, PROMPT_BATCH))
+            .map(|l| l.new_state(dev, self.context, self.prompt_batch))
             .collect::<kinetic_vulkan::Result<Vec<_>>>()?;
         let vocab = self.n_vocab();
         let mut all_logits = Commands::new(dev)?;
@@ -517,12 +506,12 @@ impl<'m> VulkanModel<'m> {
             // Tokens whose rows are not each wanted, and that no draft may
             // be rolled back over, are prompt processing, which takes them
             // in passes as large as it can.
-            let prompt = PROMPT_BATCH > MAX_BATCH
+            let prompt = self.prompt_batch > MAX_BATCH
                 && !all_rows
                 && state.checkpoint.is_none()
                 && rest.len() >= PROMPT_MIN;
             let n = rest.len().min(match prompt {
-                true => PROMPT_BATCH,
+                true => self.prompt_batch,
                 false => MAX_BATCH,
             });
             let chunk;

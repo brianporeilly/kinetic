@@ -41,6 +41,12 @@ const KERNELS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
+/// Kernels on the matrix units, for devices with cooperative f16 matrices
+/// (`Features::matrix_f16`): f16 arithmetic and cooperative matrices
+/// validate, and their modules take the Vulkan memory model. Not built for
+/// Metal, whose simdgroup matrices are 8x8.
+const MATRIX_KERNELS: &[(&str, &str, &[&str])] = &[("mm_q8_0", "", &["mm_q8_0"])];
+
 /// Kernels that take one part more on Metal, whose GEMV kernels are
 /// written differently: there an invocation takes a tile of four rows and
 /// the block sums are floats, which is faster on a Mac's GPU and slower on
@@ -78,6 +84,12 @@ fn main() {
         println!("cargo:rustc-cfg=metal_driver");
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
+    for &(name, constants, parts) in MATRIX_KERNELS {
+        let source = source(constants, parts, &["shaders"]);
+        let (module, info) = parse_with(name, &source, MATRIX_CAPABILITIES);
+        fs::write(out.join(format!("{name}.spv")), spirv(name, &module, &info))
+            .expect("write SPIR-V");
+    }
     for &(name, constants, parts) in KERNELS {
         let (module, info) = parse(name, &source(constants, parts, &["shaders"]));
         fs::write(out.join(format!("{name}.spv")), spirv(name, &module, &info))
@@ -94,15 +106,30 @@ fn main() {
     }
 }
 
+/// What every kernel may use.
+const CAPABILITIES: Capabilities = Capabilities::IMMEDIATES
+    .union(Capabilities::SUBGROUP)
+    .union(Capabilities::SHADER_FLOAT16_IN_FLOAT32);
+
+/// What the matrix kernels may use besides.
+const MATRIX_CAPABILITIES: Capabilities = CAPABILITIES
+    .union(Capabilities::SHADER_FLOAT16)
+    .union(Capabilities::COOPERATIVE_MATRIX);
+
 fn parse(name: &str, source: &str) -> (naga::Module, naga::valid::ModuleInfo) {
+    parse_with(name, source, CAPABILITIES)
+}
+
+fn parse_with(
+    name: &str,
+    source: &str,
+    capabilities: Capabilities,
+) -> (naga::Module, naga::valid::ModuleInfo) {
     let module = naga::front::wgsl::parse_str(source)
         .unwrap_or_else(|e| panic!("{name}:\n{}", e.emit_to_string(source)));
-    let info = Validator::new(
-        ValidationFlags::all(),
-        Capabilities::IMMEDIATES | Capabilities::SUBGROUP | Capabilities::SHADER_FLOAT16_IN_FLOAT32,
-    )
-    .validate(&module)
-    .unwrap_or_else(|e| panic!("{name}:\n{}", e.emit_to_string(source)));
+    let info = Validator::new(ValidationFlags::all(), capabilities)
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{name}:\n{}", e.emit_to_string(source)));
     (module, info)
 }
 
@@ -169,6 +196,8 @@ fn spirv(name: &str, module: &naga::Module, info: &naga::valid::ModuleInfo) -> V
         flags: spv::WriterFlags::empty(),
         emit_int_div_checks: false,
         force_loop_bounding: false,
+        // f16 never crosses a stage boundary in a compute kernel
+        use_storage_input_output_16: false,
         ..spv::Options::default()
     };
     let words =

@@ -7,9 +7,7 @@ use kinetic_vulkan::{ConvRing, KvCache};
 
 use super::layer::{LayerState, VulkanLayer};
 use super::{VulkanModel, VulkanState};
-use crate::device_state::{
-    narrow, past_to_ring, slots_to_window, widen, window_to_slots,
-};
+use crate::device_state::{narrow, past_to_ring, slots_to_window, widen, window_to_slots};
 use crate::model::Mark;
 use crate::warm::Runner;
 use crate::{Model, State};

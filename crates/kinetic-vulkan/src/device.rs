@@ -39,18 +39,36 @@ impl Device {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priorities)];
-        let extensions = [ash::khr::push_descriptor::NAME.as_ptr()];
+        let matrix = physical.info().features.matrix_f16;
+        let mut extensions = vec![ash::khr::push_descriptor::NAME.as_ptr()];
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(true)
             .compute_full_subgroups(true)
             .shader_integer_dot_product(true);
-        let info = vk::DeviceCreateInfo::default()
+        // what the f16 matrix kernels need, where the device has it all
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .shader_float16(matrix)
+            .vulkan_memory_model(matrix)
+            .vulkan_memory_model_device_scope(matrix);
+        let mut features11 = vk::PhysicalDeviceVulkan11Features::default()
+            .storage_buffer16_bit_access(matrix)
+            .uniform_and_storage_buffer16_bit_access(matrix);
+        let mut coop =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
-            .enabled_extension_names(&extensions)
-            .push_next(&mut features13);
+            .push_next(&mut features13)
+            .push_next(&mut features12)
+            .push_next(&mut features11);
+        if matrix {
+            extensions.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+            info = info.push_next(&mut coop);
+        }
+        let info = info.enabled_extension_names(&extensions);
         let instance = &physical.instance.raw;
         // SAFETY: `info` and what it points to are valid for the call; the
-        // features and extension were checked by `missing` above.
+        // features and extensions were checked by `missing` above, or for
+        // the matrix kernels' ones, by `matrix_f16`.
         let raw =
             unsafe { instance.create_device(physical.raw, &info, None) }.check("vkCreateDevice")?;
         // SAFETY: the queue family and index were requested above.

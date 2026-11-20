@@ -24,7 +24,7 @@ const KOSMICKRISP_MANIFESTS: [&str; 2] = [
 /// The Vulkan loader, opened at runtime, and one instance of it.
 pub struct Instance {
     /// Keeps the loader library open while the instance's functions are used.
-    _entry: ash::Entry,
+    pub(crate) entry: ash::Entry,
     pub(crate) raw: ash::Instance,
 }
 
@@ -74,7 +74,7 @@ impl Instance {
         }
         // SAFETY: `info` and what it points to are valid for the call.
         let raw = unsafe { entry.create_instance(&info, None) }.check("vkCreateInstance")?;
-        Ok(Rc::new(Instance { _entry: entry, raw }))
+        Ok(Rc::new(Instance { entry, raw }))
     }
 
     /// Every physical device, discrete GPUs first, then integrated ones, then
