@@ -9,6 +9,7 @@ use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
 /// The last `taps - 1` inputs per channel before `pos`, oldest first and
 /// zero before the start, from a ring that holds position `p` at row
 /// `p % rows`.
+#[cfg(feature = "cuda")]
 pub(crate) fn ring_to_past(
     ring: &[f32],
     rows: usize,
@@ -30,7 +31,7 @@ pub(crate) fn ring_to_past(
     past
 }
 
-/// The ring [`ring_to_past`] reads `past` from; rows of other positions
+/// The ring `ring_to_past` reads `past` from; rows of other positions
 /// are zero, which is what a fresh ring holds before the start.
 pub(crate) fn past_to_ring(
     past: &[f32],

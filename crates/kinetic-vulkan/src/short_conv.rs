@@ -50,6 +50,27 @@ impl ConvRing {
         self.data.to_vec()
     }
 
+    /// The `taps - 1` positions before `pos` as the CPU keeps them, channel
+    /// by channel: value `ch * (taps - 1) + i` is channel `ch` of position
+    /// `pos - (taps - 1) + i`, zero before the start. Reads only those
+    /// slots, which a ring for long passes holds few of.
+    pub fn save_past(&self, pos: usize) -> Result<Vec<f32>> {
+        let len = self.taps - 1;
+        let mut past = vec![0.0; self.channels * len];
+        let mut row = vec![0.0; self.channels];
+        for i in 0..len {
+            let Some(p) = (pos + i).checked_sub(len) else {
+                continue;
+            };
+            self.data
+                .copy_range_to(p % self.slots() * self.channels, &mut row)?;
+            for (ch, &x) in row.iter().enumerate() {
+                past[ch * len + i] = x;
+            }
+        }
+        Ok(past)
+    }
+
     /// Writes every slot, as [`ConvRing::save`] gives them.
     pub fn load(&mut self, slots: &[f32]) -> Result<()> {
         self.data.copy_from(slots)
